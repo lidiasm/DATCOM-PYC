@@ -1,0 +1,434 @@
+---
+title: "Preprocesamiento8"
+author: "Laura Antequera Pérez"
+date: "6/1/2022"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Preprocesamiento
+
+Para este preprocesamiento nos vamos a encargar principalmente de eliminar las filas/instancias que contengan demasiados valores perdidos, seleccionar las mejores caracaterísticas y balancear las clases para la etiqueta que sea necesario
+
+```{r message=FALSE, warning=FALSE, include=FALSE}
+library(dplyr)
+library(mice)
+library(caret)
+library(purrr)
+library(mice)
+library(ROSE)
+library(caret)
+library(naivebayes)
+library(GoodmanKruskal)
+library(e1071)
+library(ggplot2)
+```
+
+En primer lugar cargaremos los datos disponibles para entrenamiento y las etiquetas:
+```{r}
+df <- read.csv("training_set_features.csv")
+
+glimpse(df)
+
+
+label <- read.csv("training_set_labels.csv")
+glimpse(label)
+```
+
+Cargamos tambien el conjunto de pruba o test:
+
+```{r}
+#Cargamos ctest
+ctest <- read.csv("test_set_features.csv")
+respondent_id <- ctest[,1]
+ctest <- ctest[,-1]
+
+#Las comillas vacías se consideran NA
+ctest$education[ctest$education == ""] <- NA
+ctest$income_poverty[ctest$income_poverty == ""] <- NA
+ctest$marital_status[ctest$marital_status == ""] <- NA
+ctest$rent_or_own[ctest$rent_or_own == ""] <- NA
+ctest$employment_status[ctest$employment_status == ""] <- NA
+ctest$employment_industry[ctest$employment_industry == ""] <- NA
+ctest$employment_occupation[ctest$employment_occupation == ""] <- NA
+
+glimpse(ctest)
+ctest <-lapply(ctest[,1:35],as.factor)
+ctest <- as.data.frame(ctest)
+```
+
+
+
+Indicamos que las comillas vacías de las variables tipo *char* son *missing values*:
+```{r}
+df$education[df$education == ""] <- NA
+df$income_poverty[df$income_poverty == ""] <- NA
+df$marital_status[df$marital_status == ""] <- NA
+df$rent_or_own[df$rent_or_own == ""] <- NA
+df$employment_status[df$employment_status == ""] <- NA
+df$employment_industry[df$employment_industry == ""] <- NA
+df$employment_occupation[df$employment_occupation == ""] <- NA
+
+map_dbl(df, .f = function(x){sum(is.na(x))})
+```
+
+
+```{r}
+# train + label
+joined_df = merge(df,label)
+# Eliminamos la variable respondent_id
+joined_df <- joined_df[,-1]
+```
+
+```{r}
+joined_df <-lapply(joined_df[,1:37],as.factor)
+joined_df <- as.data.frame(joined_df)
+```
+
+Como vamos a realizar la clasificación siguiendo el método *Binary Relevance* vamos a separar el conjunto de entrenamiento para cada una de las etiquetas:
+```{r}
+train_seasonal <- joined_df[,-36]
+train_h1n1 <- joined_df[,-37]
+```
+
+Estudiemos cuáles son los atributos o características que deberían salir de nuestro estudio pues no nos van a aportar información útil:
+
+**Para h1n1_vaccine**:
+```{r}
+pesosG <- FSelectorRcpp::information_gain(h1n1_vaccine ~ ., train_h1n1)
+# Ordenamos y quedamos con los 10 mejores que visualizamos
+visual <- head(pesosG %>% arrange(desc(importance)),35)
+visual
+```
+Basándonos en la ganancia de información, seleccionamos las características o variables más importantes:
+```{r}
+
+train_h1n1_red <- train_h1n1[,c(10,17,16,20,15,11,19,34,35,14,1,2,18,12,6,36)]
+```
+
+Una vez que hemos seleccionado las características, estudiamos la independencia entre ellas pues sabemos que una de las limitaciones del clasificador de Naive-Bayes es la suposición de predictores totalmente independientes, lo cuál es muy difícil de lograr.
+```{r}
+GKmatrix1<- GKtauDataframe(train_h1n1_red)
+plot(GKmatrix1, corrColors = "purple2")
+```
+Observemos que `doctor_recc_h1n1` y `doctor_recc_seas` alcanza una *tau=0.53* y *tau=0.49* así que decidiremos quedarnos con `doctor_recc_h1n1` pues con este conjunto clasificaremos la etiqueta `h1n1_vaccine`. Lo mismo ocurre con `employment_industry`, `employment_occupation` y `health_worker` pues las tres mantienen una asociación muy fuerte, decidimos quedarnos con `employment_industry` que engloba tanto a `health_worker` como a `employment_occupation`. En último lugar, observamos una asociación más débil, pero destacable, entre `opinion_h1n1_risk` - `opinion_seas_risk` y entre `opinion_h1n1_vac_effective` - `opinion_seas_vac_effective`. De estas últimas, decidimos quedarnos con las que hacen referencia a `h1n1_vaccine`. Mostramos las características que mantenemos:
+
+```{r}
+train_h1n1_red <- train_h1n1_red[,-c(7,4,6,8,10)]
+colnames(train_h1n1_red)
+```
+
+Veamos cuantos $NA$ tenemos en nuestro conjunto:
+```{r}
+map_dbl(train_h1n1_red, .f = function(x){sum(is.na(x))})
+```
+
+```{r}
+delete.na <- function(DF, n=2) {
+  DF[rowSums(is.na(DF)) <= n,]
+}
+
+datos_h1n1 <- delete.na(train_h1n1_red,1)
+
+glimpse(datos_h1n1)
+map_dbl(datos_h1n1, .f = function(x){sum(is.na(x))})
+table(datos_h1n1$h1n1_vaccine)
+``` 
+
+Las clases están desbalanceadas pues en la negativa tenemos $14138$ casos y en la positiva $4820$. En el apartado de clasificación nos encargaremos de corregir este desbalanceamiento si es necesario.
+
+**A continuación, consideremos el conjunto de entrenamiento para `seasonal_vaccine`**:
+```{r}
+pesosG <- FSelectorRcpp::information_gain(seasonal_vaccine ~ ., train_seasonal, type = "infogain")
+visual <- head(pesosG %>% arrange(desc(importance)),35)
+visual
+```
+Seleccionamos las características más relevantes basándonos en la ganancia de información:
+```{r}
+train_seasonal_red <- train_seasonal[,c(19,20,11,22,34,12,15,1,29,33,2,9,28,36)]
+```
+
+
+Decidimos quitar `employment_status` pues presenta una asociación fuerte con otras dos características:
+```{r}
+train_seasonal_red <- train_seasonal_red[,-9]
+map_dbl(train_seasonal_red, .f = function(x){sum(is.na(x))})
+```
+
+```{r}
+datos_seasonal <- delete.na(train_seasonal_red,1)
+
+glimpse(datos_seasonal)
+map_dbl(datos_seasonal, .f = function(x){sum(is.na(x))})
+table(datos_seasonal$seasonal_vaccine)
+```
+
+En este caso, no creemos que sea necesario balancear las clases.
+
+## Clasificación
+
+```{r}
+#seleccionamos los atributos que finalmente se han considerado para predecir las clases a las que pertenecen cada una de las instancias
+test_seasonal <- ctest[,c(19,20,11,22,34,12,15,1,33,2,9,28)]
+test_h1n1 <- ctest[,c(10,17,16,15,34,1,2,18,12,6)]
+```
+
+```{r}
+naive_bayes1 <- naiveBayes(datos_h1n1, datos_h1n1[,11])
+
+naive_bayes2 <- naiveBayes(datos_seasonal, datos_seasonal[,13])
+
+h1n1_vacc <- predict(naive_bayes1, newdata = test_h1n1, type = "raw")
+
+seasonal_vacc <- predict(naive_bayes2, newdata = test_seasonal, type = "raw")
+
+submission25 <- data.frame(respondent_id, h1n1_vacc[,2],seasonal_vacc[,2])
+colnames(submission25) <-c('respondent_id', 'h1n1_vaccine', 'seasonal_vaccine')
+
+write.csv(submission25,"C:/Users/iemat/Desktop/Preprocesamiento/Preprocesamiento/submission25.csv", row.names = FALSE)
+```
+
+#### Vamos a balancear usando la técnica de upsampling
+```{r}
+balanceado1 <- upSample(datos_h1n1,datos_h1n1$h1n1_vaccine)
+dim(balanceado1)
+balanceado1 <- balanceado1[,-12]
+```
+
+```{r}
+naive_bayes1 <- naiveBayes(balanceado1, balanceado1[,11], laplace = 1)
+h1n1_vacc <- predict(naive_bayes1, newdata = test_h1n1, type = "raw")
+```
+
+```{r}
+prueba5 <- data.frame(respondent_id, h1n1_vacc[,2],seasonal_vacc[,2])
+colnames(prueba5) <-c('respondent_id', 'h1n1_vaccine', 'seasonal_vaccine')
+
+write.csv(prueba5,"C:/Users/iemat/Desktop/Preprocesamiento/Preprocesamiento/prueba5.csv", row.names = FALSE)
+```
+
+
+#### Vamos a balancear usando la técnica de dowsampling
+```{r}
+balanceado2 <- downSample(datos_h1n1, datos_h1n1$h1n1_vaccine)
+dim(balanceado2)
+balanceado2 <- balanceado2[,-12]
+```
+
+```{r}
+naive_bayes1 <- naiveBayes(balanceado2, balanceado2[,11], laplace = 2)
+h1n1_vacc <- predict(naive_bayes1, newdata = test_h1n1, type = "raw")
+```
+
+
+```{r}
+prueba6 <- data.frame(respondent_id, h1n1_vacc[,2],seasonal_vacc[,2])
+colnames(prueba6) <-c('respondent_id', 'h1n1_vaccine', 'seasonal_vaccine')
+
+write.csv(prueba6,"C:/Users/iemat/Desktop/Preprocesamiento/Preprocesamiento/prueba6.csv", row.names = FALSE)
+```
+Obtenemos un score en el conjunto de test entre $0.8131$ y $0.8134$, por tanto, consideramos que ambas técnicas predicen igual de bien 
+
+#### Vamos a imputar los datos de entrenamiento 
+```{r}
+imputed_Data = mice(balanceado2, m=5, maxit = 5, method = 'cart', seed = 500)
+balanceado2_imputado <- complete(imputed_Data)
+
+map_dbl(balanceado2_imputado, .f = function(x){sum(is.na(x))})
+```
+
+```{r}
+imputed_Data = mice(datos_seasonal, m=5, maxit = 5, method = 'cart', seed = 500)
+datos_seasonal_imputado <- complete(imputed_Data)
+
+map_dbl(datos_seasonal_imputado, .f = function(x){sum(is.na(x))})
+```
+
+```{r}
+naive_bayes1 <- naiveBayes(balanceado2_imputado, balanceado2_imputado[,11], laplace = 2)
+h1n1_vacc <- predict(naive_bayes1, newdata = test_h1n1, type = "raw")
+naive_bayes2 <- naiveBayes(datos_seasonal_imputado, datos_seasonal_imputado[,13])
+seasonal_vacc <- predict(naive_bayes2, newdata = test_seasonal, type = "raw")
+
+submission28 <- data.frame(respondent_id, h1n1_vacc[,2],seasonal_vacc[,2])
+colnames(submission28) <-c('respondent_id', 'h1n1_vaccine', 'seasonal_vaccine')
+
+write.csv(submission28,"C:/Users/iemat/Desktop/Preprocesamiento/Preprocesamiento/submission28.csv", row.names = FALSE)
+```
+
+### Imputamos en test
+```{r}
+imputed_Data = mice(test_seasonal, m=5, maxit = 5, method = 'cart', seed = 500)
+test_seasonal_imputado <- complete(imputed_Data)
+```
+
+```{r}
+imputed_Data = mice(test_h1n1, m=5, maxit = 5, method = 'cart', seed = 500)
+test_h1n1_imputado <- complete(imputed_Data)
+```
+
+```{r}
+h1n1_vacc <- predict(naive_bayes1, newdata = test_h1n1_imputado, type = "raw")
+seasonal_vacc <- predict(naive_bayes2, newdata = test_seasonal_imputado, type = "raw")
+
+submission29 <- data.frame(respondent_id, h1n1_vacc[,2],seasonal_vacc[,2])
+colnames(submission29) <-c('respondent_id', 'h1n1_vaccine', 'seasonal_vaccine')
+
+write.csv(submission29,"C:/Users/iemat/Desktop/Preprocesamiento/Preprocesamiento/submission29.csv", row.names = FALSE)
+```
+
+El hecho de imputar en entrenamiento y test nos baja ligeramente el score obtenido, por tanto, descartamos realizar imputación en las siguientes clasificaciones
+
+## Vamos a reducir el entrenamiento a unas 6 ó 7 características por su relevancia, basada en el estudio anterior.
+
+```{r}
+datos_seasonal <- train_seasonal[,c(15,19,20,11,22,34,12,36)]
+datos_h1n1 <- train_h1n1[,c(10,17,16,15,34,1,2,36)]
+test_seasonal <- ctest[,c(15,19,20,11,22,34,12)]
+test_h1n1 <- ctest[,c(10,17,16,15,34,1,2)]
+
+test_seasonal <-lapply(test_seasonal[,1:7],as.factor)
+test_h1n1 <-lapply(test_h1n1[,1:7],as.factor)
+
+test_seasonal <- as.data.frame(test_seasonal)
+test_h1n1 <- as.data.frame(test_h1n1)
+```
+
+
+```{r}
+balanceado2 <- downSample(datos_h1n1, datos_h1n1$h1n1_vaccine)
+dim(balanceado2)
+balanceado2 <- balanceado2[,-9]
+```
+
+Solo consideramos incluir el suavizado de laplace para *h1n1_vaccine* porque se ha incluido un atributo con $21$ categorías y seguramente posea alguna de sus categorias con frecuencia cero o cercana a cero en alguna de las clases:
+```{r}
+control= trainControl(method="repeatedcv", number=10, repeats=2)
+
+naive_bayes1 <- naiveBayes(balanceado2, balanceado2[,8], laplace = 1,trControl = control,tuneLength = 7)
+h1n1_vacc <- predict(naive_bayes1, newdata = test_h1n1, type = "raw")
+naive_bayes2 <- naiveBayes(datos_seasonal, datos_seasonal[,8],trControl = control,tuneLength = 7)
+seasonal_vacc <- predict(naive_bayes2, newdata = test_seasonal, type = "raw")
+
+submission38 <- data.frame(respondent_id, h1n1_vacc[,2],seasonal_vacc[,2])
+colnames(submission38) <-c('respondent_id', 'h1n1_vaccine', 'seasonal_vaccine')
+
+write.csv(submission38,"C:/Users/iemat/Desktop/Preprocesamiento/Preprocesamiento/submission38.csv", row.names = FALSE)
+```
+
+Hemos obtenido un score basado en la medida *AUC* de $0.81$ aproximadamente. A continuación, consideramos también incluir el suavizado de Laplace para clasificar *seasonal_vaccine*: 
+```{r}
+control= trainControl(method="repeatedcv", number=10, repeats=2)
+
+naive_bayes1 <- naiveBayes(balanceado2, balanceado2[,8], laplace = 1,trControl = control,tuneLength = 7)
+h1n1_vacc <- predict(naive_bayes1, newdata = test_h1n1, type = "raw")
+naive_bayes2 <- naiveBayes(datos_seasonal, datos_seasonal[,8],laplace=1,trControl = control,tuneLength = 7)
+seasonal_vacc <- predict(naive_bayes2, newdata = test_seasonal, type = "raw")
+
+submission39 <- data.frame(respondent_id, h1n1_vacc[,2],seasonal_vacc[,2])
+colnames(submission39) <-c('respondent_id', 'h1n1_vaccine', 'seasonal_vaccine')
+
+write.csv(submission39,"C:/Users/iemat/Desktop/Preprocesamiento/Preprocesamiento/submission39.csv", row.names = FALSE)
+```
+Se alcanza un score igual a $0.82$.
+
+
+
+## Repetimos la clasificación pero en este caso balanceamos la etiqueta h1n1_vaccine combinando la técnica oversampling con undersampling
+```{r}
+sampling_result <- ovun.sample(h1n1_vaccine ~ .,data = datos_h1n1,method = "both",N = nrow(datos_h1n1),p = 0.5,seed = 2022)
+balanced <- sampling_result$data
+```
+
+```{r}
+control= trainControl(method="repeatedcv", number=10, repeats=2)
+
+naive_bayes1 <- naiveBayes(balanced, balanced[,8], laplace = 1,trControl = control,tuneLength = 7)
+h1n1_vacc <- predict(naive_bayes1, newdata = test_h1n1, type = "raw")
+naive_bayes2 <- naiveBayes(datos_seasonal, datos_seasonal[,7],laplace=1,trControl = control,tuneLength = 7)
+seasonal_vacc <- predict(naive_bayes2, newdata = test_seasonal, type = "raw")
+
+submission42 <- data.frame(respondent_id, h1n1_vacc[,2],seasonal_vacc[,2])
+colnames(submission42) <-c('respondent_id', 'h1n1_vaccine', 'seasonal_vaccine')
+
+write.csv(submission42,"C:/Users/iemat/Desktop/Preprocesamiento/Preprocesamiento/submission42.csv", row.names = FALSE)
+```
+Considerando una combinación de la técnica *oversampling* y *undersampling* no se ha mejorado, se mantiene en $0.81$.
+
+
+
+
+# OTRAS PRUEBAS QUE NO MEJORAN NUESTRA PREDICCIÓN EN EL CONJUNTO DE PRUEBA
+# Eliminamos también la variable employmet_industry:
+
+```{r}
+datos_seas <- datos_seasonal[,-5]
+test_seas <- test_seasonal[,-5]
+datos_h1 <- datos_h1n1[,-5]
+test_h1 <- test_h1n1[,-5]
+```
+
+```{r}
+balanceado2 <- downSample(datos_h1, datos_h1$h1n1_vaccine)
+dim(balanceado2)
+balanceado2 <- balanceado2[,-8]
+```
+
+```{r}
+control= trainControl(method="repeatedcv", number=10, repeats=2)
+
+naive_bayes1 <- naiveBayes(balanceado2, balanceado2[,7], laplace = 1,trControl = control,tuneLength = 7)
+h1n1_vacc <- predict(naive_bayes1, newdata = test_h1, type = "raw")
+naive_bayes2 <- naiveBayes(datos_seas, datos_seas[,6],laplace=1,trControl = control,tuneLength = 7)
+seasonal_vacc <- predict(naive_bayes2, newdata = test_seas, type = "raw")
+
+submission40 <- data.frame(respondent_id, h1n1_vacc[,2],seasonal_vacc[,2])
+colnames(submission40) <-c('respondent_id', 'h1n1_vaccine', 'seasonal_vaccine')
+
+write.csv(submission40,"C:/Users/iemat/Desktop/Preprocesamiento/Preprocesamiento/submission40.csv", row.names = FALSE)
+```
+
+No mejora y tampoco empeora demasiado, parece ser que a pesar del gran porcentaje de valores perdidos que presenta la variable *employment_industry*, esta no es tan irrelevante (esto también se había comprobado en el estudio de la selección de características).
+
+#### Vamos a imputar k-nn y a balancear usando la técnica de dowsampling
+```{r}
+balanceado2 <- downSample(datos_h1n1, datos_h1n1$h1n1_vaccine)
+dim(balanceado2)
+balanceado2 <- balanceado2[,-9]
+```
+
+Imputamos los valores perdidos en el conjunto de entrenamiento usando el algoritmo *K-nn*:
+```{r}
+## Imputar valores perdidos con KNN
+library(DMwR2)
+
+#Observamos número de NA por cada atributo
+map_dbl(balanceado2, .f = function(x){sum(is.na(x))})
+map_dbl(datos_seasonal, .f = function(x){sum(is.na(x))})
+
+h1n1_train_impu<-knnImputation(balanceado2, scale=FALSE)
+seasonal_train_impu<-knnImputation(datos_seasonal, scale=FALSE)
+
+map_dbl(h1n1_train_impu, .f = function(x){sum(is.na(x))})
+map_dbl(seasonal_train_impu, .f = function(x){sum(is.na(x))})
+```
+
+
+```{r}
+control= trainControl(method="repeatedcv", number=10, repeats=2)
+
+naive_bayes1 <- naiveBayes(h1n1_train_impu, h1n1_train_impu[,8],laplace=1,trControl = control,tuneLength = 7)
+h1n1_vacc <- predict(naive_bayes1, newdata = test_h1n1, type = "raw")
+naive_bayes2 <- naiveBayes(seasonal_train_impu, seasonal_train_impu[,7],laplace=1,trControl = control,tuneLength = 7)
+seasonal_vacc <- predict(naive_bayes2, newdata = test_seasonal, type = "raw")
+
+submission43 <- data.frame(respondent_id, h1n1_vacc[,2],seasonal_vacc[,2])
+colnames(submission43) <-c('respondent_id', 'h1n1_vaccine', 'seasonal_vaccine')
+
+write.csv(submission43,"C:/Users/iemat/Desktop/Preprocesamiento/Preprocesamiento/submission43.csv", row.names = FALSE)
+```
+
+No se observa mejoría imputando los valores perdidos.

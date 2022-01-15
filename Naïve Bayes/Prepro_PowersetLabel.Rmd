@@ -1,0 +1,364 @@
+---
+title: "Preprocesamiento PowersetLabel"
+author: "Laura Antequera Pérez"
+date: "5/1/2022"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Preprocesamiento
+
+En este fichero vamos a llevar a cabo el método denominado *PowersetLabel*, en lugar de entrenar un clasificador para cada etiqueta vamos a unir todas las combinaciones de ambas etiquetas en una variable y se va a entrenar un único clasificador
+```{r message=FALSE, warning=FALSE, include=FALSE}
+library(dplyr)
+library(mice)
+library(caret)
+library(purrr)
+library(mice)
+library(ROSE)
+library(caret)
+library(naivebayes)
+library(GoodmanKruskal)
+library(e1071)
+library(ggplot2)
+```
+
+En primer lugar cargaremos los datos disponibles para entrenamiento y las etiquetas:
+```{r}
+df <- read.csv("training_set_features.csv")
+
+glimpse(df)
+
+
+label <- read.csv("training_set_labels.csv")
+glimpse(label)
+```
+
+
+Indicamos que las comillas vacías son *missing values*:
+```{r}
+df$education[df$education == ""] <- NA
+df$income_poverty[df$income_poverty == ""] <- NA
+df$marital_status[df$marital_status == ""] <- NA
+df$rent_or_own[df$rent_or_own == ""] <- NA
+df$employment_status[df$employment_status == ""] <- NA
+df$employment_industry[df$employment_industry == ""] <- NA
+df$employment_occupation[df$employment_occupation == ""] <- NA
+
+map_dbl(df, .f = function(x){sum(is.na(x))})
+```
+
+Como a continuación vamos a estudiar el comportamiento de los atributos con las dos etiquetas, vamos a unir ambas etiquetas en una única variable para poder realizar dicho estudio
+```{r}
+#Unimos las dos etiquetas
+label_conjunta <- label %>% mutate(conjunta = ifelse(h1n1_vaccine==0,ifelse(seasonal_vaccine==0,1,2),ifelse(seasonal_vaccine==0,3,4)))
+
+etiquetas <- factor(label_conjunta[,4])
+table(etiquetas)
+```
+
+```{r}
+joined_df = cbind(df,etiquetas)
+glimpse(joined_df)
+```
+
+```{r}
+# Eliminamos la variable respondent_id
+joined_df <- joined_df[,-1]
+joined_df <-lapply(joined_df[,1:36],as.factor)
+joined_df <- as.data.frame(joined_df)
+```
+
+La detección de ruido resulta esencial para algunos algoritmos muy sensibles.
+Veremos un ejemplo de aplicación con un algoritmo muy característico: **Iterative Partitioning Filter** implementado en el
+paquete `NoiseFiltersR`. Se basa en identificar instancias en los que los valores de alguna(s) variable(s) no se corresponde con lo esperado.Se construye un clasificador base en cada una de las `nfolds`particiones de `data`. Luego, se prueban en todo el conjunto de datos y la eliminación de instancias ruidosas se decide mediante esquemas de votación por consenso o por mayoría. Finalmente, una proporción de buenas instancias (es decir, aquellas cuya etiqueta concuerda con todos los clasificadores base) se almacena y se elimina para la siguiente iteración. El proceso se detiene después de siteraciones en las que no se han peliminado suficientes instancias ruidosas (según la proporción ). En esta implementación, el clasificador base utilizado es C4.5.
+
+```{r}
+library(NoiseFiltersR)
+set.seed(1)
+resultado <- NoiseFiltersR::IPF(etiquetas ~ ., data=joined_df, s=2)
+```
+
+Nos quedamos con el dataset limpio de ruido, observemos sus dimensiones y los *missing values* por cada atributo:
+```{r}
+joined_dfClean <- resultado$cleanData
+dim(joined_dfClean)
+map_dbl(joined_dfClean, .f = function(x){sum(is.na(x))})
+```
+
+```{r}
+delete.na <- function(DF, n=1) {
+  DF[rowSums(is.na(DF)) <= n,]
+}
+
+datos <- delete.na(joined_dfClean)
+map_dbl(datos, .f = function(x){sum(is.na(x))})
+table(datos$etiquetas)
+glimpse(datos)
+```
+
+```{r}
+pesosG <- FSelectorRcpp::information_gain(etiquetas ~ ., joined_df)
+# Ordenamos y quedamos con los 10 mejores que visualizamos
+visual <- head(pesosG %>% arrange(desc(importance)),35)
+ggplot(data=visual, aes(x=reorder(attributes, -importance), y=importance)) +
+geom_bar(fill="cornflowerblue", stat="identity")
+```
+
+```{r}
+Reduced_data<-datos[,-c(25,35,21,27,5,13,4,30,33,32,7,8, 3, 31, 29)]
+dim(Reduced_data)
+```
+```{r}
+GKmatrix1<- GKtauDataframe(Reduced_data)
+plot(GKmatrix1, corrColors = "purple2")
+```
+
+```{r}
+#Imputamos NA en train
+library(missForest)
+data_impu <- missForest(Reduced_data)
+train_clean <- data_impu$ximp
+
+map_dbl(train_clean, .f = function(x){sum(is.na(x))})
+```
+
+Cargamos el conjunto de test y seleccionamos los mismos atributos usados para el entrenamiento:
+```{r}
+#Cargamos test
+test <- read.csv("test_set_features.csv")
+respondent_id <- test[,1]
+test <- test[,-1]
+
+test$education[test$education == ""] <- NA
+test$income_poverty[test$income_poverty == ""] <- NA
+test$marital_status[test$marital_status == ""] <- NA
+test$rent_or_own[test$rent_or_own == ""] <- NA
+test$employment_status[test$employment_status == ""] <- NA
+test$employment_industry[test$employment_industry == ""] <- NA
+test$employment_occupation[test$employment_occupation == ""] <- NA
+
+glimpse(test)
+test <-lapply(test[,1:35],as.factor)
+test <- as.data.frame(test)
+test <- test[,-c(25,35,21,27,5,13,4,30,33,32,7,8, 3, 31, 29)]
+```
+
+
+#Clasificaión
+```{r}
+naive_bayes <- naiveBayes(train_clean, train_clean[,21])
+predicciones <- predict(naive_bayes, newdata = test, type = "raw")
+```
+
+```{r}
+predicciones <- as.data.frame(predicciones)
+predicciones <- predicciones %>% mutate(h1n1_vaccine = ifelse(predicciones[,1]>0.8,0,predicciones[,3]+ predicciones[,4]), seasonal_vaccine = ifelse(predicciones[,1]>0.8,0,predicciones[,2]+ predicciones[,4]))
+```
+
+```{r}
+submission24 <- data.frame(respondent_id, predicciones[,5],predicciones[,6])
+colnames(submission24) <-c('respondent_id', 'h1n1_vaccine', 'seasonal_vaccine')
+
+write.csv(submission24,"C:/Users/iemat/Desktop/Preprocesamiento/Preprocesamiento/submission24.csv", row.names = FALSE)
+```
+
+### Opción 1. Repetimos el entrenamiento añadiendo el suavizado de laplace:
+```{r}
+naive_bayes <- naiveBayes(train_clean, train_clean[,21],laplace = 1)
+predicciones1 <- predict(naive_bayes, newdata = test, type = "raw")
+```
+
+```{r}
+predicciones1 <- as.data.frame(predicciones1)
+predicciones1 <- predicciones1 %>% mutate(h1n1_vaccine = ifelse(predicciones1[,1]>0.8,0,predicciones1[,3]+ predicciones1[,4]), seasonal_vaccine = ifelse(predicciones1[,1]>0.8,0,predicciones1[,2]+ predicciones1[,4]))
+```
+
+```{r}
+prueba2 <- data.frame(respondent_id, predicciones1[,5],predicciones1[,6])
+colnames(prueba2) <-c('respondent_id', 'h1n1_vaccine', 'seasonal_vaccine')
+
+write.csv(prueba2,"C:/Users/iemat/Desktop/Preprocesamiento/Preprocesamiento/prueba2.csv", row.names = FALSE)
+```
+
+
+
+### Opción 2. vamos a ver si imputando también los valores perdidos del conjunto de test podemos obtener una mejor predicción.
+
+```{r}
+data_impu <- missForest(test)
+test_clean <- data_impu$ximp
+
+map_dbl(test_clean, .f = function(x){sum(is.na(x))})
+```
+
+```{r}
+predicciones2 <- predict(naive_bayes, newdata = test_clean, type = "raw")
+predicciones2 <- as.data.frame(predicciones2)
+predicciones2 <- predicciones2 %>% mutate(h1n1_vaccine = ifelse(predicciones2[,1]>0.8,0,predicciones2[,3]+ predicciones2[,4]), seasonal_vaccine = ifelse(predicciones2[,1]>0.8,0,predicciones2[,2]+ predicciones2[,4]))
+
+```
+
+```{r}
+prueba1 <- data.frame(respondent_id, predicciones2[,5],predicciones2[,6])
+colnames(prueba1) <-c('respondent_id', 'h1n1_vaccine', 'seasonal_vaccine')
+
+write.csv(prueba1,"C:/Users/iemat/Desktop/Preprocesamiento/Preprocesamiento/prueba1.csv", row.names = FALSE)
+
+```
+
+
+### Opción 3. Probamos a balancear las etiquetas de la variable respuesta usando la técnica downsampling 
+```{r}
+data_balanc <-downSample(train_clean,train_clean$etiquetas)
+dim(data_balanc)
+
+data_balanc <- data_balanc[,-22]
+```
+
+```{r}
+naive_bayes <- naiveBayes(data_balanc, data_balanc[,21], laplace = 1)
+predicciones3 <- predict(naive_bayes, newdata = test, type = "raw")
+```
+
+```{r}
+predicciones3 <- as.data.frame(predicciones3)
+predicciones3 <- predicciones3 %>% mutate(h1n1_vaccine = predicciones3[,3]+ predicciones3[,4], seasonal_vaccine = predicciones3[,2]+ predicciones3[,4])
+```
+
+```{r}
+prueba7 <- data.frame(respondent_id, predicciones3[,5],predicciones3[,6])
+colnames(prueba7) <-c('respondent_id', 'h1n1_vaccine', 'seasonal_vaccine')
+
+write.csv(prueba7,"C:/Users/iemat/Desktop/Preprocesamiento/Preprocesamiento/prueba7.csv", row.names = FALSE)
+```
+
+
+
+
+### Opción 4. Probamos a balancear las etiquetas de la variable respuesta usando la técnica upsampling 
+
+```{r}
+data_balanc <-upSample(train_clean,train_clean$etiquetas)
+dim(data_balanc)
+
+data_balanc <- data_balanc[,-22]
+```
+
+```{r}
+naive_bayes <- naiveBayes(data_balanc, data_balanc[,21], laplace = 1)
+predicciones4 <- predict(naive_bayes, newdata = test, type = "raw")
+```
+
+```{r}
+predicciones4 <- as.data.frame(predicciones4)
+predicciones4 <- predicciones4 %>% mutate(h1n1_vaccine = predicciones4[,3]+ predicciones4[,4], seasonal_vaccine =predicciones4[,2]+ predicciones4[,4])
+```
+
+```{r}
+submission33 <- data.frame(respondent_id, predicciones4[,5],predicciones4[,6])
+colnames(submission33) <-c('respondent_id', 'h1n1_vaccine', 'seasonal_vaccine')
+
+write.csv(submission33,"C:/Users/iemat/Desktop/Preprocesamiento/Preprocesamiento/submission33.csv", row.names = FALSE)
+```
+Obtenemos una tasa de acierto igual a $0.8078$
+
+
+
+### Opción 5. Sin imputación ni en train ni en test
+
+```{r}
+data_balanc_down <- downSample(Reduced_data,Reduced_data$etiquetas)
+dim(data_balanc_down)
+
+data_balanc_down <- data_balanc_down[,-22]
+```
+
+```{r}
+naive_bayes <- naiveBayes(data_balanc_down, data_balanc_down[,21])
+predicciones <- predict(naive_bayes, newdata = test, type = "raw")
+```
+
+```{r}
+predicciones <- as.data.frame(predicciones)
+predicciones <- predicciones %>% mutate(h1n1_vaccine = ifelse(predicciones[,1]>0.8,0,predicciones[,3]+ predicciones[,4]), seasonal_vaccine = ifelse(predicciones[,1]>0.8,0,predicciones[,2]+ predicciones[,4]))
+```
+
+```{r}
+submission30 <- data.frame(respondent_id, predicciones[,5],predicciones[,6])
+colnames(submission30) <-c('respondent_id', 'h1n1_vaccine', 'seasonal_vaccine')
+
+write.csv(submission30,"C:/Users/iemat/Desktop/Preprocesamiento/Preprocesamiento/submission30.csv", row.names = FALSE)
+```
+
+```{r}
+naive_bayes <- naiveBayes(Reduced_data, Reduced_data[,21])
+predicciones <- predict(naive_bayes, newdata = test, type = "raw")
+```
+
+```{r}
+predicciones <- as.data.frame(predicciones)
+predicciones <- predicciones %>% mutate(h1n1_vaccine = predicciones[,3]+ predicciones[,4], seasonal_vaccine=predicciones[,2]+ predicciones[,4])
+```
+
+```{r}
+submission32 <- data.frame(respondent_id, predicciones[,5],predicciones[,6])
+colnames(submission32) <-c('respondent_id', 'h1n1_vaccine', 'seasonal_vaccine')
+
+write.csv(submission32,"C:/Users/iemat/Desktop/Preprocesamiento/Preprocesamiento/submission32.csv", row.names = FALSE)
+```
+
+
+
+
+### Opción 6. Reducimos aún más la selección de atributos. 
+```{r}
+Reduced_data2 <- datos[,c(1,2,6,10,12,14,15,19,20,18,22,23,36)]
+
+#Cargamos test
+test <- read.csv("test_set_features.csv")
+respondent_id <- test[,1]
+test <- test[,-1]
+
+test$education[test$education == ""] <- NA
+test$income_poverty[test$income_poverty == ""] <- NA
+test$marital_status[test$marital_status == ""] <- NA
+test$rent_or_own[test$rent_or_own == ""] <- NA
+test$employment_status[test$employment_status == ""] <- NA
+test$employment_industry[test$employment_industry == ""] <- NA
+test$employment_occupation[test$employment_occupation == ""] <- NA
+
+glimpse(test)
+test <-lapply(test[,1:35],as.factor)
+test <- as.data.frame(test)
+test_reduced <- test[,c(1,2,6,10,12,14,15,19,20,18,22,23)]
+```
+
+
+```{r}
+data_balanc <-upSample(Reduced_data2,Reduced_data2$etiquetas)
+dim(data_balanc)
+
+data_balanc <- data_balanc[,-14]
+```
+
+```{r}
+naive_bayes <- naiveBayes(data_balanc, data_balanc[,13], laplace = 1)
+predicciones4 <- predict(naive_bayes, newdata = test_reduced, type = "raw")
+```
+
+```{r}
+predicciones4 <- as.data.frame(predicciones4)
+predicciones4 <- predicciones4 %>% mutate(h1n1_vaccine = predicciones4[,3]+ predicciones4[,4], seasonal_vaccine =predicciones4[,2]+ predicciones4[,4])
+```
+
+```{r}
+submission34 <- data.frame(respondent_id, predicciones4[,5],predicciones4[,6])
+colnames(submission34) <-c('respondent_id', 'h1n1_vaccine', 'seasonal_vaccine')
+
+write.csv(submission34,"C:/Users/iemat/Desktop/Preprocesamiento/Preprocesamiento/submission34.csv", row.names = FALSE)
+```
+

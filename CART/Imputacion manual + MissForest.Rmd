@@ -1,0 +1,229 @@
+---
+title: "Imputación de valores perdidos manual + missForest"
+author: "Alejandro Pérez Lara"
+date: "15/1/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Cargamos las librerias
+
+
+```{r }
+library(ISLR)
+library(plyr)
+library(moments)
+library(nortest)
+library(MASS)
+library(kknn)
+library(class)
+library(readxl)
+library(tidyverse)
+library(mice)
+library(VIM)
+library(caret)
+library(rpart)
+library(ggplot2)
+library(ggpubr)
+library(missForest)
+```
+## Cargamos los datos
+
+```{r }
+train = read.csv("training_set_features.csv")
+test = read.csv("test_set_features.csv")
+train_labels = read.csv("training_set_labels.csv")
+```
+
+Unimos los datos
+```{r }
+datos=rbind(train,test)
+```
+
+Eliminar la columna número 1
+```{r }
+datos = datos[,-1]
+```
+
+
+```{r }
+head(datos)
+```
+
+Asignamos los NA
+```{r }
+datos$education[datos$education == ""] <- NA
+datos$income_poverty[datos$income_poverty == ""] <- NA
+datos$marital_status[datos$marital_status == ""] <- NA
+datos$rent_or_own[datos$rent_or_own == ""] <- NA
+datos$employment_status[datos$employment_status == ""] <- NA
+datos$employment_industry[datos$employment_industry == ""] <- NA
+datos$employment_occupation[datos$employment_occupation == ""] <- NA
+```
+
+Ahora vamos a visualizar los valores NA para cada variable:
+```{r }
+ aggr_plot <- aggr(datos, col=c('blue','red'), numbers=TRUE,sortVars=TRUE, labels=names(datos), cex.axis=.7, gap=3,
+                   ylab=c("Histogram of missing data","Pattern"))
+```
+
+Observamos los datos que son NA en las variables employment_industry y employment_occupation.
+```{r }
+length(which(is.na(datos$employment_industry)))
+```
+
+
+```{r }
+length(which(is.na(datos$employment_occupation)))
+```
+Vemos cuantos de estos datos son NA debido a que en employment_status la persona se encuentra desempleada o fuera de la fuerza laboral:
+```{r }
+length(which(is.na(datos$employment_industry) & datos$employment_status == "Not in Labor Force"))
+```
+
+
+```{r }
+length(which(is.na(datos$employment_industry) & datos$employment_status == "Unemployed"))
+```
+
+Vemos que la mayoría de datos perdidos para esta variable se deben a que esas personas no se encuentran trabajando. Vamos a ver si ocurre lo mismo para employment_occupation:
+```{r }
+length(which(is.na(datos$employment_occupation) & datos$employment_status == "Not in Labor Force"))
+```
+
+
+```{r }
+length(which(is.na(datos$employment_occupation) & datos$employment_status == "Unemployed"))
+```
+Tenemos una situación similar para ambas variables por lo que vamos a imputarlas manualmente indicando en ambas si esta desempleado o no se encuentra en la fuerza laboral.
+
+```{r }
+datos$employment_industry[which(is.na(datos$employment_industry) & datos$employment_status == "Not in Labor Force")] = "Not in Labor Force"
+```
+
+
+```{r }
+datos$employment_industry[which(is.na(datos$employment_industry) & datos$employment_status == "Unemployed")] = "Unemployed"
+```
+
+
+```{r }
+datos$employment_occupation[which(is.na(datos$employment_occupation) & datos$employment_status == "Not in Labor Force")] = "Not in Labor Force"
+```
+
+
+```{r }
+datos$employment_occupation[which(is.na(datos$employment_occupation) & datos$employment_status == "Unemployed")] = "Unemployed"
+```
+
+Vemos los valores perdidos que quedan:
+```{r }
+length(which(is.na(datos$employment_occupation)))
+```
+
+
+```{r }
+length(which(is.na(datos$employment_industry)))
+```
+Visualmente:
+
+```{r }
+ aggr_plot <- aggr(datos, col=c('blue','red'), numbers=TRUE,sortVars=TRUE, labels=names(datos), cex.axis=.7, gap=3,
+                   ylab=c("Histogram of missing data","Pattern"))
+```
+
+
+```{r }
+head(datos)
+```
+Ahora vamos a imputar los valores perdidos de la variable health_insurance que determina si esa persona tiene un seguro de salud o no.
+
+El primer criterio para determinar si alguien tiene seguro médico o no va a ser la edad y vamos a imputar un 1 (tiene seguro médico) a todas las personas mayores de 65 años, esto se debe a que estan personas tiene a su disposición el seguro [Medicare](https://es.wikipedia.org/wiki/Medicare) por ser mayores de 65 años.
+
+```{r }
+length(which(is.na(datos$health_insurance) & datos$age_group == "65+ Years"))
+```
+
+
+```{r }
+datos$health_insurance[which(is.na(datos$health_insurance) & datos$age_group == "65+ Years")]=1
+```
+
+
+
+
+```{r }
+aggr_plot <- aggr(datos, col=c('blue','red'), numbers=TRUE,sortVars=TRUE, labels=names(datos), cex.axis=.7, gap=3,
+                   ylab=c("Histogram of missing data","Pattern"))
+```
+Hemos reducido considerablemente pero todavía quedan muchos valores perdidos. El criterio que vamos a utilizar a continuación es el de la renta porque a partir de lo que observamos en los [datos](https://www.cdc.gov/nchs/data/nhis/earlyrelease/insur201006.pdf) tenemos que solo un $10\%$ de las personas que son pobres no tienen seguro además observamos en los datos que muchas personas que carecen de seguro, un $52\%$ se encuentran desempleadas y a todo esto tenemos que añadir que los datos son del 2009 por lo que no existía la obligatoriedad de tener un seguro debido a que no se había implatado el programa [Obamacare](https://es.wikipedia.org/wiki/Ley_del_Cuidado_de_Salud_a_Bajo_Precio).
+
+
+Imputamos un 1 a todas aquellas personas con rentas superiores a 75000\$
+
+```{r }
+datos$health_insurance[which(is.na(datos$health_insurance) & datos$income_poverty == "> $75,000")]=1
+```
+Ahora vamos a realizar una imputación aleatoria a la gente que se encuentra desempleada donde el $52\%$ recibirán un 0 y el resto 1 en la variable health_insurance
+
+```{r }
+length(which(is.na(datos$health_insurance) & datos$employment_status == "Unemployed" ))*0.52
+```
+
+
+```{r }
+datos$health_insurance[sample(which(is.na(datos$health_insurance) & datos$employment_status == "Unemployed" ),515,replace=FALSE)] = 0
+```
+
+
+```{r }
+datos$health_insurance[which(is.na(datos$health_insurance) & datos$employment_status == "Unemployed" )] = 1
+```
+
+Vamos a hacer lo mismo para la gente que no se encuentra en la fuerza laboral, lo que ocurre es que aquí solo el $20\%$ se encuentra sin seguro
+```{r }
+length(which(is.na(datos$health_insurance) & datos$employment_status == "Not in Labor Force" ))*0.2
+```
+
+
+```{r }
+datos$health_insurance[sample(which(is.na(datos$health_insurance) & datos$employment_status == "Not in Labor Force" ),643,replace=FALSE)] = 0
+```
+
+
+```{r }
+datos$health_insurance[which(is.na(datos$health_insurance) & datos$employment_status == "Not in Labor Force" )] = 1
+```
+
+Visualizamos los datos perdidos:
+```{r }
+aggr_plot <- aggr(datos, col=c('blue','red'), numbers=TRUE,sortVars=TRUE, labels=names(datos), cex.axis=.7, gap=3,
+                   ylab=c("Histogram of missing data","Pattern"))
+```
+
+
+```{r }
+dim(datos)
+datos = lapply(datos[,1:34],as.factor)
+
+datos = as.data.frame(datos)
+str(datos)
+```
+Usamos missForest para imputar los datos:
+
+```{r }
+datos_missForest = missForest(datos)
+```
+
+
+```{r }
+datos_missForest = datos_missForest$ximp
+```
+
+```{r }
+write.csv(datos_missForest,"datos_manual+missForest.csv",row.names=FALSE)
+```
+

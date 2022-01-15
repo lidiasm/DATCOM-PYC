@@ -1,0 +1,141 @@
+---
+title: "Preprocesamiento2"
+author: "Laura Antequera Pérez"
+date: "2/1/2022"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Preprocesamiento
+
+```{r message=FALSE, warning=FALSE, include=FALSE}
+library(dplyr)
+library(mice)
+library(caret)
+library(purrr)
+library(mice)
+library(ROSE)
+library(caret)
+library(naivebayes)
+library(GoodmanKruskal)
+```
+
+En primer lugar cargaremos los datos disponibles para entrenamiento:
+```{r}
+df <- read.csv("training_set_features.csv")
+
+glimpse(df)
+```
+
+
+Analizamos cuántos *missing values* tenemos por cada variable de nuestro conjunto de datos. Y le prestaremos especial atención a las variables de tipo `char` con comillas vacias.
+```{r}
+#hay filas con NA:
+any(!complete.cases(df))
+
+#En total:
+sum(!complete.cases(df))
+
+map_dbl(df, .f = function(x){sum(is.na(x))})
+
+map_lgl(df, .f = function(x){any(!is.na(x) & x == "")})
+
+```
+
+Indicamos que las comillas vacías son *missing values*:
+```{r}
+df$education[df$education == ""] <- NA
+df$income_poverty[df$income_poverty == ""] <- NA
+df$marital_status[df$marital_status == ""] <- NA
+df$rent_or_own[df$rent_or_own == ""] <- NA
+df$employment_status[df$employment_status == ""] <- NA
+df$employment_industry[df$employment_industry == ""] <- NA
+df$employment_occupation[df$employment_occupation == ""] <- NA
+
+map_dbl(df, .f = function(x){sum(is.na(x))})
+```
+
+Como todas nuestras variables predictivas son categóricas convertimos cada una de ellas a `factor`.
+```{r}
+df <-lapply(df[,1:36],as.factor)
+glimpse(df)
+```
+
+Cargamos también el dataset de las etiquetas del conjunto de entrenamiento
+```{r}
+#cargamos labels
+label <- read.csv("training_set_labels.csv")
+glimpse(label)
+```
+
+Unimos el conjunto de entrenamiento y el de las etiquetas.
+```{r}
+# train + label
+joined_df = merge(df,label)
+joined_df <- joined_df[,-1]
+```
+
+Usaremos la medida *Kruskal y Goodman* para estudiar la fuerza de la asociación de todas las variables categóricas dos a dos. 
+```{r}
+GKmatrix1<- GKtauDataframe(joined_df)
+#plot(GKmatrix1, corrColors = "purple2")
+```
+Observamos que entre las variables predictivas no hay ninguna que tenga un coeficiente *tau* elevado, es decir, una asociación fuerte. Por tanto, no tenemos ninguna variable predictiva que se pueda predecir a partir de otra. Por otro lado, podemos nombrar las variables que presentan una asociación muy débil con las variables respuesta:
+
++ `behavioral_antiviral_meds` (columna 3)
+
++ `behavioral_avoidance` (columna 4)
+
++ `behavioral_face_mask` (columna 5)
+
++ `behavioral_large_gatherings`(columna 6)
+
++ `behavioral_outside_home` (columna 7)
+
++ `child_under_6_months` (columna 13)
+
++ `education` (columna 23)
+
++ `sex` (columna 25)
+
++ `income_poverty` (columna 26)
+
++ `marital_status` (columna 27)
+
++ `hhs_geo_region` (columna 30)
+
++ `census_msa` (columna 31)
+
++ `household_adults` (columna 32)
+
+Estás podrán ser candidatas a eliminarse de nuestro conjunto de datos para ejecutar el algoritmo de clasificación seleccionado. 
+
+
+En este guión, para la imputación de *NA* usaremos el método *random forest* (parámetro `method='rf'`).  Una opción también sería eliminar las tres variables que hemos observado que tienen más del $40$% de *missing values* junto con la variable `respondent_id`.
+```{r}
+#joined_df <- joined_df[,-c(15,34,35)]
+imputed_Data = mice(joined_df, m=5, maxit = 5, method = 'rf', seed = 500)
+data <- complete(imputed_Data)
+
+map_dbl(data, .f = function(x){sum(is.na(x))})
+```
+
+
+
+Recordemos del guión *Preprocesamiento1.Rmd* que las clases estaban desbalanceadas. Aplicamos **downsampling**, para esto tenemos que cargar el paquete `caret` y utilizar la funcion `DownSample()`. La funcion `downSample()` requiere 2 parametros, el primero es el conjunto de datos y el segundo la clase que nos interesa considerar para realizar el downsampling.
+```{r}
+data$h1n1_vaccine <- factor(data$h1n1_vaccine)
+data$seasonal_vaccine <- factor(data$seasonal_vaccine)
+
+data_balanc2 <-downSample(data,data$h1n1_vaccine)
+data_balanc2 %>%group_by(h1n1_vaccine) %>% summarise(total=n())
+data_balanc2 %>%group_by(seasonal_vaccine) %>% summarise(total=n())
+```
+
+Para el algoritmo de clasificación usaremos`data_balanc2` que se corresponde con los datos imputados (sin **NA**) y balanceados (usando la técnica **downsampling**).
+
+
+

@@ -1,0 +1,376 @@
+---
+title: "Preprocesamiento5"
+author: "Laura Antequera Pérez"
+date: "4/1/2022"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Preprocesamiento
+
+```{r message=FALSE, warning=FALSE, include=FALSE}
+library(dplyr)
+library(mice)
+library(caret)
+library(purrr)
+library(mice)
+library(ROSE)
+library(caret)
+library(naivebayes)
+library(GoodmanKruskal)
+library(e1071)
+library(ggplot2)
+```
+
+En primer lugar cargaremos los datos disponibles para entrenamiento y las etiquetas:
+```{r}
+df <- read.csv("training_set_features.csv")
+
+glimpse(df)
+
+
+label <- read.csv("training_set_labels.csv")
+glimpse(label)
+```
+
+
+Indicamos que las comillas vacías son *missing values*:
+```{r}
+df$education[df$education == ""] <- NA
+df$income_poverty[df$income_poverty == ""] <- NA
+df$marital_status[df$marital_status == ""] <- NA
+df$rent_or_own[df$rent_or_own == ""] <- NA
+df$employment_status[df$employment_status == ""] <- NA
+df$employment_industry[df$employment_industry == ""] <- NA
+df$employment_occupation[df$employment_occupation == ""] <- NA
+
+map_dbl(df, .f = function(x){sum(is.na(x))})
+```
+
+Como a continuación vamos a estudiar el comportamiento de los atributos con las dos etiquetas, vamos a unir ambas etiquetas en una única variable para poder reliazar mejor dicho estudio
+```{r}
+#Unimos las dos etiquetas
+label_conjunta <- label %>% mutate(conjunta = ifelse(h1n1_vaccine==0,ifelse(seasonal_vaccine==0,1,2),ifelse(seasonal_vaccine==0,3,4)))
+
+etiquetas <- factor(label_conjunta[,4])
+table(etiquetas)
+```
+
+```{r}
+joined_df = cbind(df,etiquetas)
+glimpse(joined_df)
+```
+
+```{r}
+# Eliminamos la variable respondent_id
+joined_df <- joined_df[,-1]
+joined_df <-lapply(joined_df[,1:36],as.factor)
+joined_df <- as.data.frame(joined_df)
+```
+
+Es bueno visualizar primero atributos relacionados entre sí.
+```{r}
+joined_df <-lapply(joined_df[,1:36],as.numeric)
+joined_df <- as.data.frame(joined_df)
+library(ggcorrplot)
+ggcorrplot(cor(joined_df[,1:36]))
+GKmatrix1<- GKtauDataframe(joined_df)
+plot(GKmatrix1)
+```
+
+Vamos a aplicar un paquete específico, `FSelectorCp` para estudiar cuáles son las variables predictivas que explican mejor a la variable respuesta. En este caso, hemos unido las dos etiquetas que tenemos en una variable respuesta con el objetivo de estudiar cuáles son las variables más importantes conjuntamente. En el fichero *Preprocesamiento7.Rmd* haremos el mismo estudio pero considerando por separado la etiqueta `h1n1_vaccine` y `seasonal_vaccine`. 
+
+```{r}
+library(FSelectorRcpp)
+
+pesosG <- FSelectorRcpp::information_gain(etiquetas ~ ., joined_df)
+# Ordenamos y quedamos con los 10 mejores que visualizamos
+visual <- head(pesosG %>% arrange(desc(importance)), 10)
+ggplot(data=visual, aes(x=reorder(attributes, -importance), y=importance)) +
+geom_bar(fill="cornflowerblue", stat="identity")
+```
+Observamos que las tres últimas variables que entran dentro del top $10$ de las más importantes para predecir en nuestra clasificación son las que más `NA` presentan así que decidimos en primer lugar usar las $7$ más importantes:
+
+```{r}
+mejores_7 <- FSelectorRcpp::cut_attrs(pesosG, k=7)
+mejores_7
+```
+La detección de ruido resulta esencial para algunos algoritmos muy sensibles, no es el caso de Naive-Bayes pero vamos a considerar su eliminación. Veremos un ejemplo de aplicación con un algoritmo muy característico: **Iterative Partitioning Filter** implementado en el
+paquete `NoiseFiltersR`. Se basa en identificar instancias en los que los valores de alguna(s) variable(s) no se corresponde con lo esperado.Se construye un clasificador base en cada una de las `nfolds`particiones de `data`. Luego, se prueban en todo el conjunto de datos y la eliminación de instancias ruidosas se decide mediante esquemas de votación por consenso o por mayoría. Finalmente, una proporción de buenas instancias (es decir, aquellas cuya etiqueta concuerda con todos los clasificadores base) se almacena y se elimina para la siguiente iteración. El proceso se detiene después de siteraciones en las que no se han peliminado suficientes instancias ruidosas (según la proporción ). En esta implementación, el clasificador base utilizado es C4.5.
+
+```{r}
+library(NoiseFiltersR)
+set.seed(1)
+resultado <- NoiseFiltersR::IPF(etiquetas ~ ., data=joined_df, s=2)
+```
+
+Nos quedamos con el dataset limpio de ruido, observemos sus dimensiones y los *missing values* por cada atributo:
+```{r}
+joined_dfClean <- resultado$cleanData
+dim(joined_dfClean)
+map_dbl(joined_dfClean, .f = function(x){sum(is.na(x))})
+```
+
+Vamos a seleccionar las $7$ variables que dijimos que eran más importantes:
+```{r}
+joined_dfBest7 <- joined_dfClean[,c(10,11,16,17,19,20,22,36)]
+map_dbl(joined_dfBest7, .f = function(x){sum(is.na(x))})
+```
+
+A continuación, vamos a usar el **modelo logístico multinomial** para imputar los NA pues tenemos factores con dos o más niveles
+```{r}
+imputed_Data = mice(joined_dfBest7, m=5, maxit = 5, method = 'polyreg', seed = 500)
+data <- complete(imputed_Data)
+
+map_dbl(data, .f = function(x){sum(is.na(x))})
+```
+
+Como las clases están desbalanceadas tendremos que aplicar alguna técnica para corregir este problema
+```{r}
+prop.table(table(data$h1n1_vaccine))
+table(data$h1n1_vaccine)
+```
+
+```{r}
+#Cargamos test
+test <- read.csv("test_set_features.csv")
+respondent_id <- test[,1]
+test <- test[,-1]
+
+test$education[test$education == ""] <- NA
+test$income_poverty[test$income_poverty == ""] <- NA
+test$marital_status[test$marital_status == ""] <- NA
+test$rent_or_own[test$rent_or_own == ""] <- NA
+test$employment_status[test$employment_status == ""] <- NA
+test$employment_industry[test$employment_industry == ""] <- NA
+test$employment_occupation[test$employment_occupation == ""] <- NA
+
+glimpse(test)
+test <-lapply(test[,1:35],as.factor)
+test <- as.data.frame(test)
+
+test <- test[,c(10,11,16,17,19,20,22)]
+```
+
+```{r}
+imputed_Data = mice(test, m=5, maxit = 5, method = 'polyreg', seed = 500)
+test_clean <- complete(imputed_Data)
+
+map_dbl(test_clean, .f = function(x){sum(is.na(x))})
+
+test_clean <-lapply(test_clean[,1:7],as.factor)
+test_clean <- as.data.frame(test_clean)
+test_clean <-lapply(test_clean[,1:7],as.numeric)
+test_clean <- as.data.frame(test_clean)
+test_clean <-lapply(test_clean[,1:7],as.factor)
+test_clean <- as.data.frame(test_clean)
+```
+
+## Clasificación
+
+```{r}
+
+train_control <- trainControl(
+  method = "cv", 
+  number = 10
+  )
+nb_grid <-   expand.grid(usekernel = c(TRUE, FALSE),
+                         laplace = c(0, 1, 2, 3), 
+                         adjust = c(0.75, 1, 1.25, 1.5))
+
+naive_bayes_via_caret6 <- train(factor(h1n1_vaccine) ~ ., 
+                               data = train[,-9], 
+                               method = "naive_bayes", 
+                               tuneGrid = nb_grid,
+                               trControl = train_control)
+
+h1n1_vacc <- predict(naive_bayes_via_caret6, newdata = test_clean, type = "prob")
+
+naive_bayes_via_caret7 <- train(factor(seasonal_vaccine) ~ ., 
+                               data = train[,-8], 
+                               method = "naive_bayes", 
+                               tuneGrid = nb_grid,
+                               trControl = train_control)
+
+seasonal_vacc <- predict(naive_bayes_via_caret7, newdata = test_clean, type = "prob")
+
+submission18 <- data.frame(respondent_id, h1n1_vacc[,2],seasonal_vacc[,2])
+colnames(submission18) <-c('respondent_id', 'h1n1_vaccine', 'seasonal_vaccine')
+
+write.csv(submission18,"C:/Users/Lenovo/OneDrive/Escritorio/Preprocesamiento/Preprocesamiento/submission18.csv", row.names = FALSE)
+```
+
+¡Con el siguiente comando comprobamos que no nos ha clasificado ninguna instancia del test como 1 en la etiqueta `h1n1_vaccine`! 
+```{r}
+# Filtramos las probabilidades>0.5 para ponerse la vacuna h1n1
+h1n1_vacc %>% filter(h1n1_vacc[,2]>0.5)
+```
+
+Vamos a balancear dicha variable:
+
+```{r}
+train$h1n1_vaccine <- factor(train$h1n1_vaccine)
+train$seasonal_vaccine <- factor(train$seasonal_vaccine)
+
+data_balanc <-downSample(train,train$h1n1_vaccine)
+data_balanc %>%group_by(h1n1_vaccine) %>% summarise(total=n())
+data_balanc %>%group_by(seasonal_vaccine) %>% summarise(total=n())
+
+data_balanc <- data_balanc[,-10]
+data_balanc <-lapply(data_balanc[,1:37],as.factor)
+glimpse(data_balanc)
+data_balanc <- as.data.frame(data_balanc)
+```
+
+Entrenamos únicamente el modelo para la variable `h1n1_vaccine`:
+```{r}
+train_control <- trainControl(
+  method = "cv", 
+  number = 10
+  )
+nb_grid <-   expand.grid(usekernel = c(TRUE, FALSE),
+                         laplace = c(0, 1, 2, 3), 
+                         adjust = c(0.75, 1, 1.25, 1.5))
+
+naive_bayes_via_caret8 <- train(h1n1_vaccine ~ ., 
+                               data = data_balanc[,-9], 
+                               method = "naive_bayes", 
+                               tuneGrid = nb_grid,
+                               trControl = train_control)
+
+h1n1_vacc <- predict(naive_bayes_via_caret8, newdata = test_clean, type = "prob")
+
+```
+
+
+Analizamos de nuevo si se ha solucionado el problema y obtenemos ahora algo más coherente:
+```{r}
+# Filtramos las probabilidades>0.5 para ponerse la vacuna h1n1
+h1n1_vacc %>% filter(h1n1_vacc[,2]>0.5)
+```
+En esta ocasión si ha clasificado como 1 en $11.422$ observaciones (ponerse la vacuna h1n1). Guardamos los datos en otro fichero
+
+
+```{r}
+submission18 <- data.frame(respondent_id, h1n1_vacc[,2],seasonal_vacc[,2])
+colnames(submission18) <-c('respondent_id', 'h1n1_vaccine', 'seasonal_vaccine')
+
+write.csv(submission18,"C:/Users/Lenovo/OneDrive/Escritorio/Preprocesamiento/Preprocesamiento/submission18.csv", row.names = FALSE)
+```
+
+
+# Mismo Preprocesamiento con las 8 mejores variables
+Vamos a seleccionar las $7$ variables que dijimos que eran más importantes: "opinion_seas_risk"           "opinion_seas_vacc_effective", "doctor_recc_seasonal", "doctor_recc_h1n1", "opinion_h1n1_risk",           "opinion_h1n1_vacc_effective", "age_group" y "health_insurance"
+```{r}
+joined_dfBest8 <- joined_dfClean[,c(10,11,15,16,17,19,20,22,36)]
+map_dbl(joined_dfBest8, .f = function(x){sum(is.na(x))})
+```
+```{r}
+delete.na <- function(DF, n=2) {
+  DF[rowSums(is.na(DF)) <= n,]
+}
+
+glimpse(joined_dfBest8)
+
+p <- delete.na(joined_dfBest8)
+
+glimpse(p)
+```
+
+```{r}
+imputed_Data = mice(p, m=5, maxit = 5, method = 'polyreg', seed = 500)
+data <- complete(imputed_Data)
+
+map_dbl(data, .f = function(x){sum(is.na(x))})
+```
+
+```{r}
+train <- data %>% mutate(h1n1_vaccine = ifelse(etiquetas==3|etiquetas==4, 1,0), seasonal_vaccine = ifelse(etiquetas==2|etiquetas==4, 1,0))
+#eliminamos la variable conjunta de etiquetas
+train <- train[,-9]
+```
+
+```{r}
+prop.table(table(train$h1n1_vaccine))
+table(train$h1n1_vaccine)
+prop.table(table(train$seasonal_vaccine))
+table(train$seasonal_vaccine)
+```
+
+```{r}
+#Cargamos test
+test <- read.csv("test_set_features.csv")
+respondent_id <- test[,1]
+test <- test[,-1]
+
+test$education[test$education == ""] <- NA
+test$income_poverty[test$income_poverty == ""] <- NA
+test$marital_status[test$marital_status == ""] <- NA
+test$rent_or_own[test$rent_or_own == ""] <- NA
+test$employment_status[test$employment_status == ""] <- NA
+test$employment_industry[test$employment_industry == ""] <- NA
+test$employment_occupation[test$employment_occupation == ""] <- NA
+
+glimpse(test)
+test <-lapply(test[,1:35],as.factor)
+test <- as.data.frame(test)
+
+test <- test[,c(10,11,15,16,17,19,20,22)]
+```
+
+```{r}
+imputed_Data = mice(test, m=5, maxit = 5, method = 'polyreg', seed = 500)
+test_clean <- complete(imputed_Data)
+
+map_dbl(test_clean, .f = function(x){sum(is.na(x))})
+
+test_clean <-lapply(test_clean[,1:8],as.factor)
+test_clean <- as.data.frame(test_clean)
+test_clean <-lapply(test_clean[,1:8],as.numeric)
+test_clean <- as.data.frame(test_clean)
+test_clean <-lapply(test_clean[,1:8],as.factor)
+test_clean <- as.data.frame(test_clean)
+```
+
+Y clasificamos:
+```{r}
+train_control <- trainControl(
+  method = "cv", 
+  number = 10
+  )
+nb_grid <-   expand.grid(usekernel = c(TRUE, FALSE),
+                         laplace = c(0, 1, 2, 3), 
+                         adjust = c(0.75, 1, 1.25, 1.5))
+
+naive_bayes_via_caret6 <- train(factor(h1n1_vaccine) ~ ., 
+                               data = train[,-10], 
+                               method = "naive_bayes", 
+                               tuneGrid = nb_grid,
+                               trControl = train_control)
+
+h1n1_vacc <- predict(naive_bayes_via_caret6, newdata = test_clean, type = "prob")
+
+naive_bayes_via_caret7 <- train(factor(seasonal_vaccine) ~ ., 
+                               data = train[,-9], 
+                               method = "naive_bayes", 
+                               tuneGrid = nb_grid,
+                               trControl = train_control)
+
+seasonal_vacc <- predict(naive_bayes_via_caret7, newdata = test_clean, type = "prob")
+
+submission19 <- data.frame(respondent_id, h1n1_vacc[,2],seasonal_vacc[,2])
+colnames(submission19) <-c('respondent_id', 'h1n1_vaccine', 'seasonal_vaccine')
+
+write.csv(submission19,"C:/Users/Lenovo/OneDrive/Escritorio/Preprocesamiento/Preprocesamiento/submission19.csv", row.names = FALSE)
+```
+
+```{r}
+# Filtramos las probabilidades>0.5 para ponerse la vacuna h1n1
+h1n1_vacc %>% filter(h1n1_vacc[,2]>0.5)
+```
+
+
+

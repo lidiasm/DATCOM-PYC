@@ -1,0 +1,1372 @@
+---
+title: "Preprocesamiento y Clasificación"
+subtitle: "Clasificación con el Algoritmo de Reglas RIPPER"
+author: "Lidia Sánchez Mérida"
+output: pdf_document
+---
+
+# Análisis Exploratorio de Datos
+
+```{r message=FALSE, warning=FALSE, include=FALSE}
+# Cargamos las librerías que vamos a necesitar para este proyecto
+## Pipelines
+library(tidyverse)
+## Análisis de correlaciones
+library(Hmisc)
+## Análisis de la importancia de los atributos
+library(FSelectorRcpp)
+## PCA
+library(factoextra)
+## MCA
+library(FactoMineR)
+## Técnicas aleatorias para balancear clases
+library(ROSE)
+## Algoritmos SMOTE para balancear clases
+library(smotefamily)
+## Imputar valores perdidos con KNN
+library(DMwR2)
+## Clasificadores de reglas
+library(RWeka)
+## Clasificadores de árboles
+library(caret)
+```
+
+En primer lugar cargamos una versión del conjunto de entrenamiento que ya contiene las etiquetas para cada paciente entrevistado. Adicionalmente se han **eliminado las siguientes columnas** por tener **más de un 40% de valores perdidos**: `health_insurance`, `employment_industry`, `employment_occupation`, en combinación con la variable `respondent_id` puesto que se trata de un **identificador único** para cada paciente entrevistado que no aporta información útil para la predicción. De este modo reducimos el número de muestras disponibles en el conjunto de entrenamiento aunque también eliminamos los valores perdidos, por lo que no será necesario aplicar ninguna técnica de imputación o tratamiento de datos faltantes. 
+
+```{r}
+# Conjunto de entrenamiento eliminando las variables de más de un 40% de NA
+# Eliminamos también el identificador único de cada paciente 
+train.df <- read.csv("training_clean.csv") %>% select(-respondent_id)
+dim(train.df)
+# Conjunto de test original
+test.df <- read.csv("test_set_features.csv")
+dim(test.df)
+```
+
+Si bien todas las variables disponen de valores nominales, se aprecia que al leerlas desde el fichero hay muchas cuyos tipos de datos son enteros. Si las transformamos a factores quizás podremos conocer cómo de balanceadas están las clases utilizando la función `summary`. 
+
+```{r}
+# Tipos de datos del conjunto de entrenamiento
+str(train.df)
+# Convertimos todas las variables a factores
+train.factors.df <- data.frame(sapply(c(1:ncol(train.df)), 
+                                      function(x) as.factor(train.df[, x])))
+# Establecemos los nombres de las columnas
+colnames(train.factors.df) <- colnames(train.df)
+# Comprobamos los tipos de datos del nuevo dataframe
+str(train.factors.df)
+# Resumen estadístico del dataset convertido a factores
+summary(train.factors.df)
+```
+
+Como podemos apreciar en el resumen estadístico anterior, **la mayoría de variables se encuentran bastante desbalanceadas** con clases que disponen de un número considerablemente mayor de muestras que las restantes. En relación a las columnas a predecir, **`h1n1_vaccine` contiene un mayor número de muestras negativas que positivas**, mientras que las categorías de la variable `seasonal_vaccine` sí se encuentran balanceadas.
+
+## Análisis de correlaciones
+
+Por otro lado podemos notar que existen una gran cantidad de variables candidatas a participar como predictores en los futuros clasificadores. Con el objetivo de comprobar las relaciones que existen entre ellas y con las variables independientes, a continuación realizamos un **análisis de correlaciones** global. Como la función `cor` solo acepta columnas numéricas, generamos un nuevo dataset transformando todas las variables. Sin embargo tal y como muestra la matriz de correlaciones, no existe ningún predictor con un coeficiente de correlación superior a 0.5 con respecto a las dos variables independientes. Por lo tanto, parece que **ninguno de los predictores dispone de una relación relevante** con respecto a las variables independientes a predecir. 
+
+```{r}
+# Convertimos todas las variables a numéricas
+train.nums.df <- data.frame(sapply(c(1:ncol(train.df)), 
+                                   function(x) as.numeric(train.df[, x])))
+# Establecemos los nombres de las columnas
+colnames(train.nums.df) <- colnames(train.df)
+# Matriz de correlación entre todas las variables
+train.cormatrix <- cor(train.nums.df)
+# Seleccionamos la diagonal inferior de la matriz
+train.cormatrix[lower.tri(train.cormatrix)] <- 0
+# Visualizamos la matriz como un dataframe para facilitar su interpretación
+train.cormatrix <- data.frame(train.cormatrix)
+train.cormatrix
+```
+
+## Análisis de la ganancia de información
+
+Tras descubrir que no existen correlaciones importantes entre los candidatos a ser predictores y las variables independientes, ahora vamos a orientar el mismo análisis según la **ganacia de información**. El objetivo es obtener la lista de atributos que más información útil aportan para la predicción de `h1n1_vaccine` y `seasonal_vaccine`. Para ello vamos a utilizar la función `information_gain` de la librería `FSelectorRcpp` con la que obtener el peso de cada atributo con respecto a cada variable a predecir. En este primer gráfico podemos observar que los atributos más relevantes para la primera variable independiente se encuentran mayormente relacionados con las **recomendaciones de vacunación procedentes de los doctores y las opiniones de los propios pacientes**. Por lo tanto parece que la vacunación de la gripe depende altamente de variables muy subjetivas por lo que puede dificultar el entrenamiento de modelos con buenas capacidades de predicción.
+
+```{r}
+# Obtenemos la relevancia de cada atributo frente a `h1n1_vaccine`
+h1n1.weights <- FSelectorRcpp::information_gain(h1n1_vaccine ~ ., train.factors.df %>% select(-seasonal_vaccine), type = "infogain")
+# Ordenamos los resultados y visualizamos los 10 atributos más importantes
+h1n1.infogain.attrs <- head(h1n1.weights %>% arrange(desc(importance)), 10)
+# Visualizamos los 10 atributos más importantes
+ggplot(data=h1n1.infogain.attrs, aes(x=reorder(attributes, -importance), y=importance)) +
+       geom_bar(fill="cornflowerblue", stat="identity") + coord_flip()
+```
+
+Por otro lado, en este segundo gráfico podemos apreciar una **tendencia similar con los atributos más relevantes** para predecir la variable `seasonal_vaccine`. Sin embargo, como en el caso anterior también podemos encontrar variables tales como el grupo de edad al que pertenecen los pacientes o si dispone de enfermedades crónicas que puedan agravar la enfermedad. Otro aspecto a destacar es que en ambos gráficos aparecen atributos relacionados con ambas variables a predecir, lo que indica que parece existir **cierta información común a `h1n1_vaccine` y `seasonal_vaccine`**.
+
+```{r}
+# Obtenemos la relevancia de cada atributo frente a `h1n1_vaccine`
+seasonal.weights <- FSelectorRcpp::information_gain(seasonal_vaccine ~ ., 
+                    train.factors.df %>% select(-h1n1_vaccine), type = "infogain")
+# Ordenamos los resultados y visualizamos los 10 atributos más importantes
+seasonal.infogain.attrs <- head(seasonal.weights %>% arrange(desc(importance)), 10)
+# Visualizamos los 10 atributos más importantes
+ggplot(data=seasonal.infogain.attrs, aes(x=reorder(attributes, -importance), y=importance)) +
+       geom_bar(fill="cornflowerblue", stat="identity") + coord_flip()
+```
+
+## Análisis del ratio de la ganancia de información
+
+Este segundo estudio utiliza una variante de la técnica anterior denominada el **ratio de la ganancia de información** la cual combina la propia ganancia junto con la información intrínseca al conjunto de datos. Como en el caso anterior utilizamos la misma función y la aplicamos individualmente a cada una de las variables independientes. En el primer gráfico podemos observar los atributos más relevantes según el ratio de la ganancia de información para la variable `h1n1_vaccine`. A diferencia del estudio anterior, en este caso podemos observar cómo en las **primeras posiciones se encuentran variables más objetivas**, como `health_worker` que representa si el paciente cuenta con un seguro médico. No obstante en este segundo conjunto también **predominan los predictores asociados a las opiniones de los pacientes y a las recomendaciones sanitarias**.
+
+```{r}
+# Obtenemos la relevancia de cada atributo frente a `h1n1_vaccine`
+h1n1.weights <- FSelectorRcpp::information_gain(h1n1_vaccine ~ ., 
+              train.factors.df %>% select(-seasonal_vaccine), type = "gainratio")
+# Ordenamos los resultados y visualizamos los 10 atributos más importantes
+h1n1.gainratio.attrs <- head(h1n1.weights %>% arrange(desc(importance)), 10)
+# Visualizamos los 10 atributos más importantes
+ggplot(data=h1n1.gainratio.attrs, aes(x=reorder(attributes, -importance), y=importance)) +
+       geom_bar(fill="cornflowerblue", stat="identity") + coord_flip()
+```
+
+Algo similar ocurre al aplicar este filtrado de columnas para predecir la variable `seasonal_vaccine`, si bien la mayoría de variables siguen relacionadas con las opiniones de los pacientes y las recomendaciones de vacunación, existen otras asociadas con la edad, el seguro médico o el lavado frecuente de manos.
+
+```{r}
+# Obtenemos la relevancia de cada atributo frente a `seasonal_vaccine`
+seasonal.weights <- FSelectorRcpp::information_gain(seasonal_vaccine ~ ., 
+                train.factors.df %>% select(-h1n1_vaccine), type = "gainratio")
+# Ordenamos los resultados y visualizamos los 10 atributos más importantes
+seasonal.gainratio.attrs <- head(seasonal.weights %>% arrange(desc(importance)), 10)
+# Visualizamos los 10 atributos más importantes
+ggplot(data=seasonal.gainratio.attrs, aes(x=reorder(attributes, -importance), y=importance)) +
+       geom_bar(fill="cornflowerblue", stat="identity") + coord_flip()
+```
+
+## Análisis de la incertidumbre simétrica
+
+Finalmente existe una métrica denominada la **incertidumbre simétrica** que calcula la **importancia entre cada atributo y cada una de las clases de la variable independiente**. Si la aplicamos sobre `h1n1_vaccine` podemos observar que el conjunto de los diez atributos más relevantes es prácticamente una mezcla de los dos conjuntos anteriores. La **mayoría están asociados a las opiniones de los pacientes y las recomendaciones de vacunación**, mientras que existen otras variables relativas a tener un **seguro médico, el conocimiento o la preocupación sobre el virus**. 
+
+```{r}
+# Obtenemos la relevancia de cada atributo frente a `h1n1_vaccine`
+h1n1.weights <- FSelectorRcpp::information_gain(h1n1_vaccine ~ ., 
+              train.factors.df %>% select(-seasonal_vaccine), type = "symuncert")
+# Ordenamos los resultados y visualizamos los 10 atributos más importantes
+h1n1.symuncert.attrs <- head(h1n1.weights %>% arrange(desc(importance)), 10)
+# Visualizamos los 10 atributos más importantes
+ggplot(data=h1n1.symuncert.attrs, aes(x=reorder(attributes, -importance), y=importance)) +
+       geom_bar(fill="cornflowerblue", stat="identity") + coord_flip()
+```
+
+Una situación similar ocurre al calcular la incertidumbre simétrica con respecto a la variable independiente `seasonal_vaccine`, en cuyo conjunto también predominan las variables relativas a las opiniones y recomendaciones aunque también se integran columnas de otro tipo referidas al grupo de edad de los pacientes, estado laboral o seguro médico.
+
+```{r}
+# Obtenemos la relevancia de cada atributo frente a `seasonal_vaccine`
+seasonal.weights <- FSelectorRcpp::information_gain(seasonal_vaccine ~ ., 
+                  train.factors.df %>% select(-h1n1_vaccine), type = "symuncert")
+# Ordenamos los resultados y visualizamos los 10 atributos más importantes
+seasonal.symuncert.attrs <- head(seasonal.weights %>% arrange(desc(importance)), 10)
+# Visualizamos los 10 atributos más importantes
+ggplot(data=seasonal.symuncert.attrs, aes(x=reorder(attributes, -importance), y=importance)) +
+       geom_bar(fill="cornflowerblue", stat="identity") + coord_flip()
+```
+
+## Análisis de Componentes Principales
+
+En esta sección procedemos a realizar un *Principal Component Analysis* (PCA) para comprobar qué porcentaje de información podríamos obtener si realizamos combinaciones lineales entre las variables a medida que reducimos la dimensionalidad. Para ello utilizaremos la función `prcomp` basada en la **descomposición simple de valores** con la que se comprueba las convarianzas y correlaciones entre individuos. En el siguiente gráfico se representa la cantidad de información que contiene cada uno de los principales componentes resultantes de aplicar PCA sobre el conjunto de entrenamiento. Como podemos observar la **explicabilidad que recopilan cada uno de ellos es considerablemente baja**, puesto que con los tres primeros únicamente se alcanza un 51.3% del total. Por lo tanto parece que necesitaremos incluir al menos las diez primeras dimensiones para disponer de aproximádamente un 80% de explicabilidad con las que entrenar nuevos clasificadores basados en reglas.
+
+```{r}
+# PCA basado en la descomposición espectral de variables
+train.pca <- prcomp(train.nums.df %>% select(-h1n1_vaccine, -seasonal_vaccine))
+# Representación del nivel de información según se reduce la dimensionalidad
+fviz_eig(train.pca, addlabels=TRUE)
+```
+
+No obstante, con el objetivo de conseguir algo más de información acerca de la contribución de cada variable a continuación representamos dos gráficos con los predictores que más aportaciones realizan a las dos primeras dimensiones que acumulan un 42% del total de los datos. En el primer caso podemos apreciar que **únicamente la variable `hhs_geo_region` es la que contribuye en la explicabilidad del 27.4%** de los datos. Según la descripción de la variable parece ser que **el lugar de residencia del paciente representa casi un tercio de la información** contenida en el primer componente del análisis. En contraposición podemos apreciar una mayor diversidad en relación a los predictores contribuyentes de la segunda dimensión. La gran mayoría de variables involucradas están relacionadas con las **opiniones de los propios pacientes acerca de la efectividad, los riesgos y la preocupación** asociada a las vacunas.
+
+```{r}
+# Representación de las 6 variables que más información aportan en la primera dimensión
+fviz_contrib(train.pca, choice = "var", axes = 1, top = 6)
+# Representación de las 6 variables que más información aportan en la segunda dimensión
+fviz_contrib(train.pca, choice = "var", axes = 2, top = 6)
+```
+
+
+## Multiple Correspondence Analysis
+
+Existe una extensión de la técnica anterior conocida como *Multiple Correspondence Analysis* (MCA) que es capaz de realizar un **análisis PCA sobre variables nominales**. El objetivo de esta sección es experimentar si existen diferencias entre los resultados proporcionados por ambas técnicas. Para ello haremos uso de la función `MCA` integrada en el paquete `FactoMineR`. Como los gráficos que resultantes no se encuentran configurados no disponen de una buena visibilidad debido a la gran cantidad de datos, por lo que ejecutamos la función sin mostrarlos. Sin embargo, como en el caso anterior, sí que representamos la cantidad de información contenida en cada una de las dimensiones generadas. Como podemos apreciar los **porcentajes de explicabilidad procedentes de este algoritmo son considerablemente inferiores a los del PCA**. Esto nos indica que las combinaciones que ha realizado entre las diferentes variables nominales tampoco parecen ser útiles para el entrenamiento de clasificadores basados en reglas.
+
+```{r}
+# MCA sobre el conjunto de entrenamiento con variables categóricas
+train.mca <- MCA(train.factors.df %>% select(-h1n1_vaccine, seasonal_vaccine), graph=FALSE)
+# Representación del nivel de información según se reduce la dimensionalidad
+fviz_screeplot(train.mca, addlabels = TRUE)
+```
+
+Como en la sección anterior a continuación mostramos los gráficos de las variables que más contribuyen a las dos primeras dimensiones que únicamente son capaces de almacenar menos de un 10% del total de los datos. Los predictores más influyentes en la **primera dimensión parecen estar asociados al estilo de vida de los pacientes**, considerando aspectos tales como su educación, estado laboral, civil y económico. Adicionalmente se encuentra la primera categoría de la variable `opinion_seas_risk` que representa la creencia de que existe una **baja probabilidad de contraer la gripe estacional sin estar vacunado**. Por lo tanto parece ser que existe cierta relación entre esta hipótesis y las características anteriores. El segundo gráfico también se compone de los mismos atributos aunque el último denominado `h1n1_concern_3` hace referencia a la **gran preocupación de ciertos pacientes con respecto a este virus**. Esto puede indicarnos que en la primera dimensión se encuentran aquellos pacientes que no creen en la infección del virus, mientras que en la segunda dimensión está representada por aquellas personas a las que sí les preocupa enfermar. 
+
+```{r}
+# Representación de las 6 variables que más información aportan en la primera dimensión
+fviz_contrib(train.mca, choice = "var", axes = 1, top = 6)
+# Representación de las 6 variables que más información aportan en la segunda dimensión
+fviz_contrib(train.mca, choice = "var", axes = 2, top = 6)
+```
+
+# Clasificadores basados en Reglas
+
+Con el objetivo de facilitar la generación del fichero CSV final con las probabilidades positivas sobre el conjunto de validación, a continuación se ha implementado una función capaz de componer un dataset con la estructura requerida para posteriormente escribir los resultados en un archivo.
+
+```{r}
+# Función para generar el fichero CSV con las probabilidades positivas sobre
+# el conjunto de test.
+create.probs.files <- function(h1n1.probs, season.probs) {
+  probs.df <- data.frame(respondent_id=test.df$respondent_id, 
+                         h1n1_vaccine=c(h1n1.probs),  
+                         seasonal_vaccine=c(season.probs))
+  write.csv(probs.df, "submission_file.csv", row.names = FALSE)
+}
+```
+
+## Sin preprocesamiento
+
+En este primer experimento se han entrenado dos clasificadores de forma individual, uno para cada variable a predecir sin introducir ningún tipo de preprocesamiento más allá de la eliminación de las columnas descritas anteriormente. El objetivo consiste en comprobar el comportamiento de un algoritmo basado en reglas con el que predecir una variable muy desbalanceada como es `h1n1_vaccine` y una segunda variable `seasonal_vaccine` más equilibrada. Tal y como se requiere en la práctica, se ha utilizado validación cruzada para el entrenamiento del primer modelo con el que predecir `h1n1_vaccine` utilizando 10 particiones. Según el informe de este primer clasificador podemos apreciar que dispone de una **tasa de aciertos del 82.82% pero un coeficiente de Kappa del 42.44%**, lo que nos indica que su comportamiento no se diferencia de la actuación de un modelo aleatorio. Por lo tanto parece que no se caracteriza por una buena capacidad de predicción. Si observamos la matriz de confusión existe una **mayor proporcioón de muestras positivas mal clasificadas** que de ejemplos negativos, puesto que se ha equivocado en un 36% aproximadamente del total. Debido al gran desbalanceamiento de esta variable, es posible que el clasificador se encuentre **fuertemente sesgado por la clase mayoritaria** pero como el conjunto de entrenamiento contiene bastantes muestras de esta categoría, es fácil alcanzar un alto porcentaje de aciertos aunque no haya aprendido nada.
+
+```{r}
+# Eliminamos los atributos `health_insurance`, `employment_industry`, 
+# `employment_occupation` y `respondent_id` del conjunto de test
+test.prep.df <- test.df %>% select(-health_insurance, -employment_industry, -employment_occupation, -respondent_id)
+
+# Modelo de reglas solo para la variable `h1n1_vaccine`
+ripper1.h1n1 <- JRip(h1n1_vaccine~., train.factors.df %>% select(-seasonal_vaccine))
+# Aplicamos validación cruzada durante 10 iteraciones sobre entrenamiento
+ripper1.h1n1.cv <- evaluate_Weka_classifier(ripper1.h1n1, numFolds=10, seed=2022)
+ripper1.h1n1.cv
+# Predicciones sobre el conjunto de test
+ripper1.h1n1.preds <- predict(ripper1.h1n1, test.prep.df, "probability")
+```
+
+En este segundo modelo entrenado para clasificar la otra variable `seasonal_vaccine` el **porcentaje de acierto sobre el conjunto de entrenamiento disminuye hasta un 76.09% aunque el coeficiente de Kappa aumenta** ligeramente. No obstante continua alrededor del 52%, lo que indica que pese a que esta variable independiente se encuentra balanceada, el modelo está realizando las predicciones aleatoriamente. En este caso la matriz de confusión demuestra que existen aproximádamente el **mismo número de muestras mal clasificadas de cada clase**, por lo que parece que este clasificador no se encuentra influenciado por ninguna de ellas en particular.
+
+```{r}
+# Modelo de reglas solo para la variable `seasonal_vaccine`
+ripper1.season <- JRip(seasonal_vaccine~., train.factors.df %>% select(-h1n1_vaccine))
+# Aplicamos validación cruzada durante 10 iteraciones
+ripper1.season.cv <- evaluate_Weka_classifier(ripper1.season, numFolds=10, seed=2022)
+ripper1.season.cv
+# Predicciones sobre el conjunto de test
+ripper1.season.preds <- predict(ripper1.season, test.prep.df, type = 'probability')
+
+# Generamos el fichero de probabilidades sobre el conjunto de test
+create.probs.files(ripper1.h1n1.preds[,2], ripper1.season.preds[,2])
+```
+
+## Primer preprocesamiento: balancear las clases de `h1n1_vaccine`
+
+En este segundo experimento el objetivo es conocer si mejora el porcentaje de acierto sobre el conjunto de test al balancear las clases de la variable `h1n1_vaccine`. Así, el clasificador que se encarga de su predicción no se verá influenciado por la clase mayoritaria. Para ello vamos a aplicar dos técnicas: *undersampling* y *oversampling*. La primera de ellas consiste en eliminar muestras de la clase predominante hasta prácticamente igualar el número de ejemplos de la clase minoritaria, mientras que la segunda técnica replica muestras de la clase minoritaria hasta que ambas se encuentre equilibradas. Existen diversas implementaciones que aplican sendas técnicas de forma aleatoria o mediante algoritmos más sofisticados.
+
+### Undersampling aleatorio
+
+Comenzamos aplicando la técnica de **undersampling aleatorio** para reducir el número de ejemplares de la clase mayoritaria. Tal y como hemos observado en el análisis exploratorio, esta variable cuenta con **21.033 muestras negativas y 5.674 muestras positivas**, por lo que provocará un grave decremento en el número de ejemplos para entrenar el modelo. Para aplicarla vamos a utilizar la función `ovun.sample` de la librería `ROSE` especificando el método `under` y estableciendo una semilla para que los resultados sean reproducibles. Adicionalmente, al ser un conjunto de datos más reducido se ha aumentado el número de particiones al aplicar validación cruzada por si produjese alguna mejora en la capacidad del clasificador. Como podemos apreciar en los resultados de este segundo modelo, la **precisión sobre el conjunto de entrenamiento disiminuye hasta un 74.36% aunque el coeficiente de Kappa apenas se incrementa un 6%**, por lo que parece que la capacidad de generalización de este clasificador tras aplicar *undersampling* no ha mejorado demasiado. Según la matriz de confusión parece que existe una **ligera concentración de errores al clasificar muestras positivas** aunque sendas tasas de errores se encuentran muy igualadas.
+
+```{r}
+# Nuevo dataset tras aplicar undersampling
+train.under.df <- ovun.sample(h1n1_vaccine~., data=train.factors.df, 
+                              method="under", seed=2022)$data
+# Dimensiones del nuevo dataset
+dim(train.under.df)
+# Número de instancias para cada clase de la variable `h1n1_vaccine`
+summary(train.under.df$h1n1_vaccine)
+
+# Modelo de reglas solo para la variable `h1n1_vaccine` 
+ripper2.h1n1 <- JRip(h1n1_vaccine~., train.under.df %>% select(-seasonal_vaccine))
+# Aplicamos validación cruzada durante 100 iteraciones sobre entrenamiento
+ripper2.h1n1.cv <- evaluate_Weka_classifier(ripper2.h1n1, numFolds=100, seed=2022)
+ripper2.h1n1.cv
+# Predicciones sobre el conjunto de test
+ripper2.h1n1.preds <- predict(ripper2.h1n1, test.prep.df, "probability")
+# Generamos el fichero de probabilidades sobre el conjunto de test
+create.probs.files(ripper2.h1n1.preds[,2], ripper1.season.preds[,2])
+```
+
+### Oversampling aleatorio
+
+El objetivo de esta segunda sección consiste en aplicar la técnica *oversampling* para duplicar muestras de la clase minoritaria y así aumentar su población. Sin embargo, debido al coste computacional y temporal que implica este algoritmo además del aumento del número de datos hasta alcanzar el doble de muestras del conjunto original, **no se ha podido obtener un clasificador en un tiempo prudencial**. Adicionalmente, considerando el gran desbalanceamiento de las clases este nuevo conjunto de entrenamiento podría haber **insertado cierto ruido** al generar tantísima cantidad de muestras para equilibrar sendas categorías. 
+
+```{r}
+# Nuevo dataset tras aplicar oversampling
+#train.over.df <- ovun.sample(h1n1_vaccine~., data=train.factors.df, 
+#                              method="over", seed=2022)$data
+# Dimensiones del nuevo dataset
+#dim(train.over.df)
+# Número de instancias para cada clase de la variable `h1n1_vaccine`
+#summary(train.over.df$h1n1_vaccine)
+
+# Tercer modelo de reglas solo para la variable `h1n1_vaccine` utilizando
+# el conjunto aumentado mediante oversampling
+#ripper3.h1n1 <- JRip(h1n1_vaccine~., train.over.df %>% select(-seasonal_vaccine))
+# Aplicamos validación cruzada durante 10 iteraciones sobre entrenamiento
+#ripper3.h1n1.cv <- evaluate_Weka_classifier(ripper3.h1n1, numFolds=10, seed=2022)
+#ripper3.h1n1.cv
+# Predicciones sobre el conjunto de test
+#ripper3.h1n1.preds <- predict(ripper3.h1n1, test.prep.df, "probability")
+# Generamos el fichero de probabilidades sobre el conjunto de test
+#create.probs.files(ripper3.h1n1.preds[,2], ripper1.season.preds[,2])
+```
+
+### Undersampling y oversampling aleatorio
+
+Para finalizar con las técnicas aleatorias vamos a **combinar los dos procedimientos** para intentar disponer de un conjunto de datos con un número mayor de muestras que tras aplicar *undersampling* pero con un volumen menor que en el caso anterior para conseguir un tercer modelo con un menor coste computacional y temporal. En este tercer clasificador se ha obtenido una **tasa de aciertos del 78.62% sobre el conjunto de entrenamiento** tras aplicar validación cruzada durante 10 iteraciones. Adicionalmente, podemos observar que el **coeficiente de Kappa también ha aumentado hasta el 57.25%**, lo que indica que el comportamiento de este modelo se caracteriza por ser algo más diferente que el de un clasificador aleatorio. Observando la matriz de confusión podemos apreciar que existe una **mayor tasa de errores al clasificar las muestras positivas**. Por lo tanto, parece que al equilibrar las clases de la variable `h1n1_vaccine` combinando sendas técnicas aleatorias, este clasificador ha mejorado su capacidad de generalización.
+
+```{r}
+# Nuevo dataset tras aplicar oversampling y undersampling
+train.both.df <- ovun.sample(h1n1_vaccine~., data=train.factors.df, 
+                              method="both", seed=2022)$data
+# Dimensiones del nuevo dataset
+dim(train.both.df)
+# Número de instancias para cada clase de la variable `h1n1_vaccine`
+summary(train.both.df$h1n1_vaccine)
+
+# Modelo de reglas solo para la variable `h1n1_vaccine` 
+ripper3.h1n1 <- JRip(h1n1_vaccine~., train.both.df %>% select(-seasonal_vaccine))
+# Aplicamos validación cruzada durante 10 iteraciones sobre entrenamiento
+ripper3.h1n1.cv <- evaluate_Weka_classifier(ripper3.h1n1, numFolds=10, seed=2022)
+ripper3.h1n1.cv
+# Predicciones sobre el conjunto de test
+ripper3.h1n1.preds <- predict(ripper3.h1n1, test.prep.df, "probability")
+# Generamos el fichero de probabilidades sobre el conjunto de test
+create.probs.files(ripper3.h1n1.preds[,2], ripper1.season.preds[,2])
+```
+
+### SMOTE
+
+Al margen de los muestreos aleatorios, el algoritmo *Synthetic Minority Oversampling Technique* (*SMOTE*) es capaz de aplicar *oversampling* para generar muestras sintéticas a partir de un conjunto de vecinos con el objetivo de balancear el número de ejemplos de cada clase. El objetivo de esta sección consiste en intentar mejorar la calidad del balanceamiento de la variable `h1n1_vaccine` y así obtener un clasificador con una mayor capacidad de predicción. Para ello haremos uso de las diferentes variantes implementadas en la librería `smotefamily`. Comenzamos aplicando el **algoritmo original** mediante la función `SMOTE` que recibe como parámetros un dataset con **todas las columnas numéricas**, la variable que se pretende balancear y el número de vecinos que se consideran para generar las muestras, por defecto son 5. Si aplicamos esta técnica sobre el conjunto de entrenamiento original, donde recordemos que existen aproximádamente cuatro veces más ejemplos negativos que positivos, puede que se generen **demasiadas muestras sintéticas** que resten valor a la información real. Por ello, se genera un nuevo dataset a partir de las **muestras negativas reducidas de la sección anterior y las muestras positivas del conjunto original**. Así disponemos de un dataset menos desbalanceado con 13.303 ejemplos negativos y 5.674 positivos.
+
+```{r}
+# Nuevo dataset con muestras negativas reducidas aleatoriamente y las muestras
+# positivas del conjunto de entrenamiento original
+train.hybrid.df <- rbind(train.both.df[train.both.df$h1n1_vaccine == 0, ], 
+                         train.factors.df[train.factors.df$h1n1_vaccine == 1, ])
+# Dimensiones del nuevo dataset híbrido
+dim(train.hybrid.df)
+# Desbalanceamiento de la clase `h1n1_vaccine`
+summary(train.hybrid.df$h1n1_vaccine)
+# Convertimos el dataset a columnas numéricas
+train.hybrid.nums.df <- data.frame(sapply(c(1:ncol(train.hybrid.df)), function(x) as.numeric(train.hybrid.df[, x])))
+# Establecemos los nombres de las columnas
+colnames(train.hybrid.nums.df) <- colnames(train.hybrid.df)
+```
+
+Tras aplicar el algoritmo SMOTE con la configuración comentada anteriormente disponemos de un nuevo conjunto más equilibrado con **11.348 muestras positivas**. Sin embargo, como se aprecia en los resultados de este cuarto clasificador entrenado con validación cruzada durante 10 iteraciones, la **tasa de aciertos disminuye hasta un 70.28% y el coeficiente de Kappa alcanza el valor mínimo** hasta el momento con un 39.47%. Si observamos la matriz de confusión podemos notar que **la mayoría de errores se concentran en la clasificación de la clase mayoritaria**, por lo que parece que este modelo no termina de aprender este tipo de muestras correctamente. Así que a pesar de utilizar una técnica más compleja para balancear las clases de la variable independiente, este clasificador presenta unas métricas de menor calidad que los modelos anteriores generados con un dataset balanceado aleatoriamente.
+
+```{r}
+# Nuevo dataset tras aplicar SMOTE
+train.smote.df <- SMOTE(train.hybrid.nums.df %>% select(-seasonal_vaccine), 
+                        train.hybrid.nums.df$h1n1_vaccine)$data
+# Convertimos el dataset resultante en factores para seguir entrenando los
+# modelos bajo las mismas condiciones
+train.smote.df <- data.frame(sapply(c(1:ncol(train.smote.df)), 
+                                    function(x) as.factor(train.smote.df[, x])))
+colnames(train.smote.df) <- colnames(train.hybrid.nums.df)
+# Dimensiones del nuevo dataset
+dim(train.smote.df)
+# Número de instancias para cada clase de la variable `h1n1_vaccine`
+summary(train.smote.df$h1n1_vaccine)
+
+# Moodelo de reglas solo para la variable `h1n1_vaccine`
+ripper4.h1n1 <- JRip(h1n1_vaccine~., train.smote.df %>% select(-seasonal_vaccine))
+# Aplicamos validación cruzada durante 10 iteraciones sobre entrenamiento
+ripper4.h1n1.cv <- evaluate_Weka_classifier(ripper4.h1n1, numFolds=10, seed=2022)
+ripper4.h1n1.cv
+```
+
+### ANS
+
+El algoritmo *Adaptive Neighbor SMOTE* es una variante de la técnica anterior en la que se **calcula el número de vecinos a considerar para cada una de las muestras de la clase minoritaria automáticamente**. De este modo es el propio algoritmo el que se encarga de obtener el número de muestras a considerar para generar cada una de las sintéticas y así no se encuentra influenciado por la elección del usuario. Nuevamente lo aplicamos sobre el dataset compuesto por las muestras negativas reducidas aleatoriamente y los ejemplos positivos originales. Como podemos apreciar este algoritmo ha conseguido obtener un total de **11.152 muestras positivas**. Sin embargo, al entrenar un quinto modelo con el algoritmo basado en reglas y validación cruzada durante 10 iteraciones la **tasa de aciertos disminuye hasta un 67.46% y el coeficiente de Kappa hasta un 33.49%**. Observando la matriz de confusión podemos notar cómo las **muestras positivas continúan protagonizando la mayoría de errores de clasificación**. Por lo tanto parece ser que el balanceamiento con ANS tampoco ayuda a mejorar la capacidad de predicción de la variable `h1n1_vaccine`.
+
+```{r}
+# Nuevo dataset para balancear las clases de `h1n1_vaccine` con SMOTE
+train.ans.df <- ANS(train.hybrid.nums.df %>% select(-seasonal_vaccine), 
+                    train.hybrid.nums.df$h1n1_vaccine)$data
+# Convertimos el dataset resultante en factores para seguir entrenando los
+# modelos bajo las mismas condiciones
+train.ans.df <- data.frame(sapply(c(1:ncol(train.ans.df)), 
+                                   function(x) as.factor(train.ans.df[, x])))
+colnames(train.ans.df) <- colnames(train.hybrid.nums.df)
+# Dimensiones del nuevo dataset
+dim(train.ans.df)
+# Número de instancias para cada clase de la variable `h1n1_vaccine`
+summary(train.ans.df$h1n1_vaccine)
+
+# Modelo de reglas solo para la variable `h1n1_vaccine` 
+ripper5.h1n1 <- JRip(h1n1_vaccine~., train.ans.df %>% select(-seasonal_vaccine))
+# Aplicamos validación cruzada durante 10 iteraciones sobre entrenamiento
+ripper5.h1n1.cv <- evaluate_Weka_classifier(ripper5.h1n1, numFolds=10, seed=2022)
+ripper5.h1n1.cv
+```
+
+### DBSMOTE
+
+Existe una variante adicional del algoritmo SMOTE conocida como *Density-based SMOTE* que utiliza **técnicas de *clustering* para agrupar las muestras de la clase minoritaria con las que generar los ejemplos sintéticos** a partir de las distancias entre las originales. Los parámetros que recibe son los mismos que en el algoritmo original, incluyendo el número de vecinos que considera para generar las muestras sintéticas (cinco por defecto). De nuevo lo aplicamos sobre el dataset con muestras negativas reducidas aleatoriamente y los ejemplos positivos del conjunto de entrenamiento original. A diferencia de los anteriores algoritmos de la misma familia, DBSMOTE solo ha sido capaz de obtener un total de **10.830 datos positivos**. Como podemos observar en el sexto clasificador entrenado con el dataset resultante aplicando una validación cruzada de 10 iteraciones, la **tasa de aciertos se encuentra alrededor de un 72.62% mientras que el coeficiente de Kappa sigue por debajo del 45%**. Como en los clasificadores anteriores, son los **ejemplos positivos los que mayor número de muestras mal clasificadas contienen**, por lo que este algoritmo de balanceamiento de clases tampoco ayuda a mejorar el aprendizaje de un algoritmo basado en reglas.
+
+```{r}
+# Nuevo dataset para balancear las clases de `h1n1_vaccine` con SMOTE
+train.dbsmote.df <- DBSMOTE(train.hybrid.nums.df %>% select(-seasonal_vaccine), 
+                            train.hybrid.nums.df$h1n1_vaccine)$data
+# Convertimos el dataset resultante en factores para seguir entrenando los
+# modelos bajo las mismas condiciones
+train.dbsmote.df <- data.frame(sapply(c(1:ncol(train.dbsmote.df)), 
+                                   function(x) as.factor(train.dbsmote.df[, x])))
+colnames(train.dbsmote.df) <- colnames(train.hybrid.nums.df)
+# Dimensiones del nuevo dataset
+dim(train.dbsmote.df)
+# Número de instancias para cada clase de la variable `h1n1_vaccine`
+summary(train.dbsmote.df$h1n1_vaccine)
+
+# Modelo de reglas solo para la variable `h1n1_vaccine`
+ripper6.h1n1 <- JRip(h1n1_vaccine~., train.dbsmote.df %>% select(-seasonal_vaccine))
+# Aplicamos validación cruzada durante 10 iteraciones sobre entrenamiento
+ripper6.h1n1.cv <- evaluate_Weka_classifier(ripper6.h1n1, numFolds=10, seed=2022)
+ripper6.h1n1.cv
+# Predicciones sobre el conjunto de test
+ripper6.h1n1.preds <- predict(ripper6.h1n1, test.prep.df, "probability")
+# Generamos el fichero de probabilidades sobre el conjunto de test
+create.probs.files(ripper6.h1n1.preds[,2], ripper1.season.preds[,2])
+```
+
+### Conclusiones
+
+Tras experimentar con diferentes algoritmos de balanceamiento de clases para equilibrar la variable `h1n1_vaccine`, hemos podido apreciar cómo las técnicas más sencillas de **muestreo aleatorio y duplicado de registros** parecen haber aportado más información útil a los clasificadores puesto que han conseguido mejores valores en métricas de calidad, tales como la tasa de aciertos y el coeficiente de Kappa. Por lo tanto, para este dataset y problema en particular los métodos aleatorios más sencillos parecen resultar más beneficiosos en el balanceamiento de esta variable independiente que los algoritmos más sofisticados de la familia SMOTE.
+
+## Segundo preprocesamiento: selección de características
+
+A continuación procedemos a aplicar el mejor preprocesamiento obtenido anteriormente para balancear las clases de la variable `h1n1_vaccine` en combinación con las diferentes técnicas de selección de características aplicadas durante el análisis exploratorio del dataset. El objetivo es comprobar el comportamiento del algoritmo basado en reglas al combinar dos técnicas de preprocesamiento, una para balancear las clases de la variable `h1n1_vaccine`, mientras que por otro lado realizamos combinaciones lineales o no lineales para aumentar el porcentaje de información del dataset. Para ello haremos **uso del conjunto de datos obtenido mediante *oversampling* y *undersampling* aleatoriamente**.
+
+### Ganancia de Información
+
+En esta primera combinación de técnicas de preprocesamiento procedemos a utilizar los resultados obtenidos durante el **análisis de la ganancia de información** realizado anteriormente para la variable `h1n1_vaccine`. Para ello generamos un nuevo dataset con los **10 atributos caracterizados como más relevantes** y añadimos la variable independiente con el objetivo de entrenar un nuevo clasificador. Según las medidas de calidad podemos apreciar que dispone de una **tasa de aciertos del 76% aproximádamente y un coeficiente de Kappa del 52%**. Esto nos indica que pese a haber reducido un tercio del total de atributos el modelo mantiene la misma capacidad de predicción aunque es más sencillo puesto que cuenta con una menor cantidad de predictores. Si observamos la matriz de confusión podemos apreciar que existe prácticamente el **mismo número de muestras mal clasificadas de ambas clases**. Una posibles explicación es que dichos ejemplares dispongan de valores similares que no permitan al modelo acertar con sus respectivas clases. 
+
+```{r}
+# Nuevo dataset de entrenamiento a partir de la ganancia de información
+train.h1n1.infogain.df <- train.both.df %>% 
+  select(h1n1.infogain.attrs$attributes, h1n1_vaccine)
+# # Nuevo dataset de test a partir de la ganancia de información
+test.h1n1.infogain.df <- test.prep.df %>% select(h1n1.infogain.attrs$attributes)
+
+# Modelo para `h1n1_vaccine` a partir del dataset anterior
+ripper7.h1n1 <- JRip(h1n1_vaccine~., train.h1n1.infogain.df)
+# Validación cruzada durante 10 iteraciones
+ripper7.h1n1.cv <- evaluate_Weka_classifier(ripper7.h1n1, numFolds=10, seed=2022)
+ripper7.h1n1.cv
+# Predicciones sobre el conjunto de test
+ripper7.h1n1.preds <- predict(ripper7.h1n1, test.h1n1.infogain.df, "probability")
+```
+
+Aplicamos el mismo proceso para entrenar otro clasificador particular a la variable `seasonal_vaccine` con sus propios atributos más relevantes obtenidos del estudio comentado anteriormente. Como podemos observar en los siguientes resultados, este segundo modelo para la variable independiente ha conseguido una tasa de **aciertos del 75.52% y un coeficiente de Kappa de 50.79%**. Como en el caso anterior parece haber un **equilibrio entre el número de muestras mal clasificadas de ambas clases** aunque en este modelo parece destacar el número de errores de la clase negativa. De nuevo parece que al reducir el número de atributos a los diez más importantes según el primer análisis de ganancia de información la capacidad de predicción del modelo se mantiene prácticamente igual.
+
+```{r}
+# Nuevo dataset de entrenamiento a partir de la ganancia de información
+train.season.infogain.df <- train.factors.df %>% 
+  select(seasonal.infogain.attrs$attributes, seasonal_vaccine)
+# Nuevo dataset de test a partir de la ganancia de información
+test.season.infogain.df <- test.prep.df %>% select(seasonal.infogain.attrs$attributes)
+
+# Modelo para `seasonal_vaccine` con el dataset anterior
+ripper2.season <- JRip(seasonal_vaccine~., train.season.infogain.df)
+# Validación cruzada durante 10 iteraciones
+ripper2.season.cv <- evaluate_Weka_classifier(ripper2.season, numFolds=10, seed=2022)
+ripper2.season.cv
+# Predicciones sobre el conjunto de test
+ripper2.season.preds <- predict(ripper2.season, test.season.infogain.df, "probability")
+
+# Generamos el fichero de probabilidades sobre el conjunto de test
+create.probs.files(ripper7.h1n1.preds[,2], ripper2.season.preds[,2])
+```
+
+### Ratio de la Ganancia de Información
+
+Aplicamos el mismo procedimiento anterior para entrenar dos nuevos clasificadores a partir del conjunto de variables obtenido tras el estudio del ratio de la ganancia de información. Este primer modelo tiene como objetivo predecir la variable `h1n1_vaccine` y como podemos observar en los resultados se ha conseguido un **75.31% de aciertos y un 50.64% de coeficiente de Kappa**. Parece ser que las diez variables más relevantes según el ratio de la ganancia de información producen un modelo con algo menos de calidad que considerando púramente la ganancia. Sin embargo, observando la matriz de confusión podemos apreciar que de nuevo existe un **equilibrio aproximado entre el número de muestras mal clasificadas de cada clase**.
+
+```{r}
+# Nuevo dataset de entrenamiento a partir del ratio de la ganancia de información
+train.h1n1.gainratio.df <- train.both.df %>% 
+  select(h1n1.gainratio.attrs$attributes, h1n1_vaccine)
+# Nuevo dataset de test a partir del ratio de la ganancia de información
+test.h1n1.gainratio.df <- test.prep.df %>% select(h1n1.gainratio.attrs$attributes)
+
+# Modelo para `h1n1_vaccine` a partir del dataset anterior
+ripper8.h1n1 <- JRip(h1n1_vaccine~., train.h1n1.gainratio.df)
+# Validación cruzada durante 10 iteraciones
+ripper8.h1n1.cv <- evaluate_Weka_classifier(ripper8.h1n1, numFolds=10, seed=2022)
+ripper8.h1n1.cv
+# Predicciones sobre el conjunto de test
+ripper8.h1n1.preds <- predict(ripper8.h1n1, test.h1n1.gainratio.df, "probability")
+```
+
+El tercer clasificador entrenado para predecir la variable `seasonal_vaccine` dispone de una tasa de **aciertos del 76.62% y un coeficiente de Kappa del 50.72%**. A diferencia de la variable independiente anterior, en este caso los atributos elegidos según el ratio de la ganancia de información han conseguido mejorar ligeramente las métricas de calidad con respecto a considerar la ganancia únicamente. Si observamos la matriz de confusión podemos apreciar que existe un **mayor número de errores al clasificar las muestras positivas**, lo que nos indica que este modelo todavía no ha terminado de aprender correctamente el patrón de esta clase.
+
+```{r}
+# Nuevo dataset de entrenamiento a partir de la ganancia de información
+train.season.gainratio.df <- train.both.df %>% 
+  select(seasonal.gainratio.attrs$attributes, seasonal_vaccine)
+# Nuevo dataset de test a partir de la ganancia de información
+test.season.gainratio.df <- test.prep.df %>% select(seasonal.gainratio.attrs$attributes)
+
+# Modelo para `seasonal_vaccine` con el dataset anterior
+ripper3.season <- JRip(seasonal_vaccine~., train.season.gainratio.df)
+# Validación cruzada durante 10 iteraciones
+ripper3.season.cv <- evaluate_Weka_classifier(ripper3.season, numFolds=10, seed=2022)
+ripper3.season.cv
+# Predicciones sobre el conjunto de test
+ripper3.season.preds <- predict(ripper3.season, test.season.gainratio.df, "probability")
+
+# Generamos el fichero de probabilidades sobre el conjunto de test
+create.probs.files(ripper8.h1n1.preds[,2], ripper3.season.preds[,2])
+```
+
+### Incertidumbre Simétrica
+
+Finalmente aplicamos el mismo procedimiento que los dos anteriores para entrenar dos nuevos clasificadores con la selección de características realizada a partir del estudio de la incertidumbre simétrica. Comenzamos con el clasificador particular a la variable `h1n1_vaccine`, cuyos resultados podemos comprobar que son **muy similares a la ganancia de información**. Dispone de una tasa de **aciertos del 75.93% y un coeficiente de Kappa del 51.87%**. En este caso más que en ningún otro podemos apreciar un equilibrio casi perfecto del número de muestras erróneamente clasificadas de ambas categorías.
+
+```{r}
+# Nuevo dataset de entrenamiento a partir de la incertidumbre simétrica
+train.h1n1.symuncert.df <- train.both.df %>% 
+  select(h1n1.symuncert.attrs$attributes, h1n1_vaccine)
+# # Nuevo dataset de test a partir del ratio de la incertidumbre simétrica
+test.h1n1.symuncert.df <- test.prep.df %>% select(h1n1.symuncert.attrs$attributes)
+
+# Modelo para `h1n1_vaccine` a partir del dataset anterior
+ripper9.h1n1 <- JRip(h1n1_vaccine~., train.h1n1.symuncert.df)
+# Validación cruzada durante 10 iteraciones
+ripper9.h1n1.cv <- evaluate_Weka_classifier(ripper9.h1n1, numFolds=10, seed=2022)
+ripper9.h1n1.cv
+# Predicciones sobre el conjunto de test
+ripper9.h1n1.preds <- predict(ripper9.h1n1, test.h1n1.symuncert.df, "probability")
+```
+A continuación generamos un cuarto clasificador con la selección de atributos para `seasonal_vaccine` resultante de calcular la incertidumbre simétrica. Como en el caso anterior, las métricas de calidad también disponen de valores muy similares al clasificador obtenido con la ganancia de información. Sin embargo, si observamos la matriz de confusión podemos apreciar que se repite la tendencia de cometer un **mayor número de errores en clasificar las muestras positivas**.
+
+```{r}
+# Nuevo dataset de entrenamiento a partir de la incertidumbre simétrica
+train.season.symuncert.df <- train.both.df %>% 
+  select(seasonal.symuncert.attrs$attributes, seasonal_vaccine)
+# Nuevo dataset de test a partir de la incertidumbre simétrica
+test.season.symuncert.df <- test.prep.df %>% select(seasonal.symuncert.attrs$attributes)
+
+# Modelo para `seasonal_vaccine` con el dataset anterior
+ripper4.season <- JRip(seasonal_vaccine~., train.season.symuncert.df)
+# Validación cruzada durante 10 iteraciones
+ripper4.season.cv <- evaluate_Weka_classifier(ripper4.season, numFolds=10, seed=2022)
+ripper4.season.cv
+# Predicciones sobre el conjunto de test
+ripper4.season.preds <- predict(ripper4.season, test.season.symuncert.df, "probability")
+
+# Generamos el fichero de probabilidades sobre el conjunto de test
+create.probs.files(ripper9.h1n1.preds[,2], ripper4.season.preds[,2])
+```
+
+### Principal Component Analysis
+
+Comenzamos aplicando **PCA al conjunto de entrenamiento y test** para entrenar dos nuevos clasificadores, uno por cada variable independiente. Tal y como observamos en el análisis de los resultados de esta técnica, con los diez primeros componentes obtenemos un 80% de explicabilidad de los datos. Sin embargo, **al utilizar estas diez primeras dimensiones tanto la tasa de aciertos como el coeficiente de Kappa disminuyen** considerablemente un 6% y un 13%, respectivamente, que si utilizamos las 33 dimensiones disponibles. Por lo tanto los dos siguientes nuevos clasificadores serán entrenados con todos los componentes resultantes de aplicar PCA sobre el conjunto de entrenamiento y test. **El primer modelo asociado a `h1n1_vaccine` dispone de una tasa de aciertos del 79.76% y un coeficiente de Kappa de aproximádamente el 60%**. Es el mejor clasificador obtenido hasta el momento para la variable en particular en base a los valores de estas métricas de calidad. Por otro lado, el segundo modelo relativo a `seasonal_vaccine` ha obtenido una **tasa de aciertos del 79.15% pero un coeficiente de Kappa del 54.7%**, por lo que parece que no ha mejorado su capacidad de predicción tras aplicar PCA.
+
+```{r}
+# Convertimos el dataset balanceado con undersampling+overampling a numérico
+train.both.nums.df <- data.frame(sapply(c(1:ncol(train.both.df)), 
+                                   function(x) as.numeric(train.both.df[, x])))
+# Añadimos los nombres de las columnas
+colnames(train.both.nums.df) <- colnames(train.both.df)
+# Obtenemos un nuevo dataset tras aplicar PCA sobre entrenamiento
+train.pca.df <- data.frame(predict(train.pca, train.both.nums.df))
+# Añadimos las dos variables independientes
+train.pca.df$h1n1_vaccine <- as.factor(train.both.nums.df$h1n1_vaccine)
+train.pca.df$seasonal_vaccine <- as.factor(train.both.nums.df$seasonal_vaccine)
+# Obtenemos un nuevo dataset tras aplicar PCA sobre test
+test.nums.df <- data.frame(sapply(c(1:ncol(test.prep.df)), 
+                                   function(x) as.numeric(test.prep.df[, x])))
+colnames(test.nums.df) <- colnames(test.prep.df)
+test.pca.df <- data.frame(predict(train.pca, test.nums.df))
+
+# Modelo de reglas solo para la variable `h1n1_vaccine` 
+ripper10.h1n1 <- JRip(h1n1_vaccine~., train.pca.df %>% select(-seasonal_vaccine))
+# Aplicamos validación cruzada durante 10 iteraciones sobre entrenamiento
+ripper10.h1n1.cv <- evaluate_Weka_classifier(ripper10.h1n1, numFolds=10, seed=2022)
+ripper10.h1n1.cv
+# Predicciones sobre el conjunto de test
+ripper10.h1n1.preds <- predict(ripper10.h1n1, test.pca.df, "probability")
+
+# Modelo de reglas solo para la variable `seasonal_vaccine`
+ripper5.season <- JRip(seasonal_vaccine~., train.pca.df %>% select(-h1n1_vaccine))
+# Aplicamos validación cruzada durante 10 iteraciones sobre entrenamiento
+ripper5.season.cv <- evaluate_Weka_classifier(ripper5.season, numFolds=10, seed=2022)
+ripper5.season.cv
+# Predicciones sobre el conjunto de test
+ripper5.season.preds <- predict(ripper5.season, test.pca.df, "probability")
+
+# Generamos el fichero de probabilidades sobre el conjunto de test
+create.probs.files(ripper10.h1n1.preds[,2], ripper5.season.preds[,2])
+```
+
+### Conclusiones
+
+Tras experimentar con diversos algoritmos para seleccionar las características más relevantes con la que continuar mejorando los clasificadores de ambas variables independientes, podemos concluir que el que **mejores métricas de calidad ha presentado ha sido el PCA** tanto por la tasa de aciertos como por el coeficiente de Kappa. En las restantes técnicas hemos podido comprobar que los resultados han sido bastante similares entre clasificadores y entre los propios métodos si bien utilizan elementos diferentes para la extracción de características. Por un lado la **ganancia de información** ha proporcionado el mejor clasificador **para `h1n1_vaccine`**, mientras que por otro parece que ha sido el **ratio de la ganancia de información** la métrica que mejor modelo ha originado para la **predicción de la variable `seasonal_vaccine`**.
+
+
+## Tercer preprocesamiento: imputación de valores perdidos
+
+El objetivo de este tercer subapartado consiste en introducir técnicas de imputación de valores perdidos en combinación con los métodos de balanceamiento de clases y selección de características que mejores resultados han proporcionado para continuar aumentando la capacidad de predicción de los clasificadores. 
+
+### K-Nearest Neighbours
+
+La primera técnica que pretendemos utilizar para **imputar los valores perdidos tanto en el conjunto de entrenamiento como en el de test** es el algoritmo de los K vecinos más cercanos. Esta técnica genera un determinado valor para **reemplazar un dato perdido a partir de las K muestras más similares o con menor distancia**. Para ello vamos a utilizar la función `knnImputation` de la librería `DMwR2` sobre los datasets originales de este problema. Como podemos observar ambos conjuntos disponen de un total de 60.762 y 60.551 valores perdidos, respectivamente y tras ejecutar la función anterior todos ellos han sido reemplazados por los valores sintéticos generados por el algoritmo.
+
+```{r}
+# Cargamos los conjuntos de entrenamiento y test originales 
+train.orig.df <- read.csv("training_set_features.csv")
+train.orig.labels <- read.csv("training_set_labels.csv")
+test.orig.df <- read.csv("test_set_features.csv")
+# Codificamos las cadenas vacías como valores perdidos (NA)
+train.na.df <- data.frame(sapply(1:ncol(train.orig.df), 
+         function(x) ifelse(train.orig.df[, x] == "", NA, train.orig.df[, x])))
+# Establecemos de nuevo los nombres de las columnas
+colnames(train.na.df) <- colnames(train.orig.df)
+# Imputamos los valores perdidos con KNN
+sum(is.na(train.na.df))
+train.knn.df <- knnImputation(train.na.df, scale=FALSE)
+sum(is.na(train.knn.df))
+
+# Replicamos el mismo proceso para el conjunto de test
+test.na.df <- data.frame(sapply(1:ncol(test.orig.df), 
+         function(x) ifelse(test.orig.df[, x] == "", NA, test.orig.df[, x])))
+colnames(test.na.df) <- colnames(test.orig.df)
+# Imputamos los valores perdidos con KNN
+sum(is.na(test.na.df))
+test.knn.df <- knnImputation(test.na.df, scale=FALSE)
+sum(is.na(test.knn.df))
+```
+Una vez disponemos del conjunto de entrenamiento limpio de valores perdidos, a continuación balanceamos las clases de la variable independiente `h1n1_vaccine` mediante *oversampling* y *undersampling* aleatorio. De este modo conseguimos obtener un total de 13.303 muestras negativas y 13.404 muestras positivas. A continuación entremos un primer modelo particular para la anterior variable independiente aplicando, como en los casos anteriores, validación cruzada durante 10 iteraciones. Como podemos apreciar en los resultados, este clasificador se caracteriza por tener una tasa de **aciertos del 79.70% y un coeficiente de Kappa del 59.37%**. Según estas métricas de calidad, la capacidad de predicción del modelo parece ser muy similar a los clasificadores entrenados con PCA. Si observamos su matriz de confusión podemos apreciar cierta tendencia a **clasificar erróneamente un mayor número de muestras positivas** por lo que parece que tiene ciertas dificultades para identificar los ejemplares negativos.
+
+```{r}
+# Añadimos las variables independientes y eliminamos el identificador único
+train.knn.df <- merge(train.knn.df, train.orig.labels) %>% select(-respondent_id)
+# Balanceamos la clase `h1n1_vaccine` con oversampling+undersampling
+train.knn.both.df <- ovun.sample(h1n1_vaccine~., data=train.knn.df, 
+                              method="both", seed=2022)$data
+# Dimensión del nuevo conjunto de datos
+dim(train.knn.both.df)
+# Balanceamiento de las clases de `h1n1_vaccine`
+summary(as.factor(train.knn.both.df$h1n1_vaccine))
+
+# Modelo para `h1n1_vaccine` 
+ripper11.h1n1 <- JRip(as.factor(h1n1_vaccine)~., train.knn.both.df %>% select(-seasonal_vaccine))
+# Validación cruzada durante 10 iteraciones
+ripper11.h1n1.cv <- evaluate_Weka_classifier(ripper11.h1n1, numFolds=10, seed=2022)
+ripper11.h1n1.cv
+# Predicciones sobre el conjunto de test
+ripper11.season.preds <- predict(ripper11.h1n1, test.missforest.df, "probability")
+```
+
+```{r}
+train.knn.smote.df <- SMOTE(train.knn.df %>% select(-seasonal_vaccine), 
+                        train.knn.df$h1n1_vaccine)$data
+train.knn.smote.df <- data.frame(sapply(c(1:ncol(train.knn.smote.df)), 
+                                    function(x) as.factor(train.knn.smote.df[, x])))
+colnames(train.knn.smote.df) <- colnames(train.knn.df)
+
+# Modelo para `h1n1_vaccine` 
+r.h1n1 <- JRip(as.factor(h1n1_vaccine)~., train.knn.smote.df %>% select(-seasonal_vaccine))
+r.h1n1.cv <- evaluate_Weka_classifier(r.h1n1, numFolds=10, seed=2022)
+r.h1n1.cv
+r.h1n1.preds <- predict(r.h1n1, test.knn.df, "probability")
+
+# Modelo para `seasonal_vaccine` 
+r.season <- JRip(as.factor(seasonal_vaccine)~., train.knn.smote.df %>% select(-h1n1_vaccine))
+r.season.cv <- evaluate_Weka_classifier(r.season, numFolds=10, seed=2022)
+r.season.cv
+r.season.preds <- predict(r.season, test.knn.df, "probability")
+
+create.probs.files(r.h1n1.preds[,2], r.season.preds[,2])
+```
+
+Repetimos el mismo procedimiento anterior para entrenar un nuevo modelo con el que predecir la segunda variable independiente `seasonal_vaccine`. Tal y como se muestra en los resultados, este clasificador ha conseguido un **78.67% de precisión y un coeficiente de Kappa de 54.03%**, valores ligeramente menores que los clasificadores entrenados con datasets imputando mediante *Random Forest*. Al observar su matriz de confusión podemos apreciar que **apenas clasifica correctamente la mitad de las muestras negativas** por lo que parece ciertamente influido por la clase positiva.
+
+```{r}
+# Modelo para `seasonal_vaccine` 
+ripper6.season <- JRip(as.factor(seasonal_vaccine)~., 
+                       train.knn.both.df %>% select(-h1n1_vaccine))
+# Validación cruzada durante 10 iteraciones
+ripper6.season.cv <- evaluate_Weka_classifier(ripper6.season, numFolds=10, seed=2022)
+ripper6.season.cv
+# Predicciones sobre el conjunto de test
+ripper6.season.preds <- predict(ripper6.season, test.knn.df, "probability")
+
+# Generamos el fichero de probabilidades sobre el conjunto de test
+create.probs.files(ripper11.season.preds[,2], ripper6.season.preds[,2])
+```
+
+A continuación procedemos a **integrar PCA** sobre el conjunto de entrenamiento y test imputados con KNN para intentar aumentar la capacidad de predicción del clasificador combinando linealmente las variables disponibles. Como podemos observar en el siguiente gráfico, la primera componente dispone de un **41.3% de explicabilidad de los datos, mientras que las dos primeras almacenan el 72.5% del total**. A diferencia del PCA aplicado sobre el conjunto de entrenamiento sin imputar, en este caso las primeras dimensiones prácticamente aportan el 80% aproximádamente de toda la información disponible, por lo que nos permite reducir la dimensionalidad del problema y aumentar la cantidad de datos útiles para entrenar mejores clasificadores.
+
+```{r}
+# PCA basado en la descomposición espectral de variables
+train.knn.pca <- prcomp(train.knn.both.df 
+                               %>% select(-h1n1_vaccine, -seasonal_vaccine))
+# Representación del nivel de información según se reduce la dimensionalidad
+fviz_eig(train.knn.pca, addlabels=TRUE)
+```
+
+Aplicando el mismo procedimiento anterior construimos un nuevo clasificador para predecir la variable `h1n1_vaccine` a partir del dataset de entrenamiento imputado con KNN y combinando los predictores con PCA. En los siguientes resultados podemos observar que las métricas de calidad disminuyen ligeramente con respecto a los anteriores modelos a cuyos datasets no se les había aplicado la técnica anterior. Por lo tanto parece que el algoritmo **PCA no provoca ninguna mejoría en la capacidad de predicción de los modelos**.
+
+```{r}
+# Obtenemos un nuevo dataset tras aplicar PCA sobre entrenamiento
+train.knn.pca.df <- data.frame(predict(train.knn.pca, train.knn.both.df))
+# Añadimos las dos variables independientes
+train.knn.pca.df$h1n1_vaccine <- as.factor(train.knn.both.df$h1n1_vaccine)
+train.knn.pca.df$seasonal_vaccine <- as.factor(train.knn.both.df$seasonal_vaccine)
+# Obtenemos un nuevo dataset tras aplicar PCA sobre test
+test.knn.pca.df <- data.frame(sapply(c(1:ncol(test.knn.df)), 
+                                   function(x) as.numeric(test.knn.df[, x])))
+colnames(test.knn.pca.df) <- colnames(test.knn.df)
+test.knn.pca.df <- data.frame(predict(train.knn.pca, test.knn.pca.df))
+
+# Modelo de reglas solo para la variable `h1n1_vaccine` 
+ripper12.h1n1 <- JRip(h1n1_vaccine~., train.knn.pca.df %>% 
+                        select(-seasonal_vaccine))
+# Aplicamos validación cruzada durante 10 iteraciones sobre entrenamiento
+ripper12.h1n1.cv <- evaluate_Weka_classifier(ripper12.h1n1, numFolds=10, seed=2022)
+ripper12.h1n1.cv
+# Predicciones sobre el conjunto de test
+ripper12.h1n1.preds <- predict(ripper12.h1n1, test.knn.pca.df, "probability")
+```
+En este segundo clasificador entrenado para predecir la variable `seasonal_vaccine` del mismo modo que el caso anterior, podemos apreciar
+
+```{r}
+# Modelo para `seasonal_vaccine` 
+ripper7.season <- JRip(seasonal_vaccine~., train.knn.pca.df %>% select(-h1n1_vaccine))
+# Validación cruzada durante 10 iteraciones
+ripper7.season.cv <- evaluate_Weka_classifier(ripper7.season, numFolds=10, seed=2022)
+ripper7.season.cv
+# Predicciones sobre el conjunto de test
+ripper7.season.preds <- predict(ripper7.season, test.knn.pca.df, "probability")
+
+# Generamos el fichero de probabilidades sobre el conjunto de test
+create.probs.files(ripper12.h1n1.preds[,2], ripper7.season.preds[,2])
+```
+
+### MissForest
+
+En esta sección procedemos a cargar un nuevo **conjunto de entrenamiento y otro de validación cuyos valores perdidos han sido imputados utilizando la función `missForest`** del paquete `missForest`. Su objetivo consiste en observar los valores existentes para posteriormente generar unos sintéticos aplicando la conocida técnica de *Random Forest*. Tras ser leídos a continuación balanceamos las clases de la variable independiente `h1n1_vaccine` con la mejor combinación hasta ahora conocida entre *oversampling* y *undersampling* aleatorio. Así disponemos de **13.303 muestras negativas y 13.404 ejemplos positivos**.
+
+```{r}
+# Cargamos dos nuevos ficheros con los datos imputados mediante MissForest
+train.missforest.df <- read.csv("train_MissForest.csv")
+# Añadimos las dos variables independientes del conjunto de entrenamiento original
+train.missforest.df$h1n1_vaccine <- as.factor(train.df$h1n1_vaccine)
+train.missforest.df$seasonal_vaccine <- as.factor(train.df$seasonal_vaccine)
+test.missforest.df <- read.csv("test_MissForest.csv")
+# Aplicamos undersampling y oversampling a la variable `h1n1_vaccine`
+train.missforest.both.df <- ovun.sample(h1n1_vaccine~., data=train.missforest.df, 
+                              method="both", seed=2022)$data
+# Dimensiones del nuevo dataset
+dim(train.missforest.both.df)
+# Número de instancias para cada clase
+summary(as.factor(train.missforest.both.df$h1n1_vaccine))
+```
+
+Una vez disponemos de un conjunto de entrenamiento balanceado vamos a generar dos nuevos modelos, uno para cada variable independiente, a partir de los datasets anteriores y aplicando validación cruzada durante 10 iteraciones. Este primer clasificador tiene como objetivo predecir la variable `h1n1_vaccine` y según las métricas de calidad dispone de un **79.36% de aciertos y 58.72% de coeficiente de Kappa**. Por lo tanto, se trata de uno de los modelos de mayor calidad entrenados hasta el momento. Si observamos su matriz de confusión podemos apreciar que existe una **tendencia a clasificar erróneamente un mayor número de muestras positivas como negativas**, por lo que parece ser que este clasificador continúa sin identificar correctamente los ejemplares de la antigua clase minoritaria.
+
+```{r}
+# Modelo para `h1n1_vaccine` 
+ripper13.h1n1 <- JRip(h1n1_vaccine~., train.missforest.both.df %>% select(-seasonal_vaccine))
+# Validación cruzada durante 10 iteraciones
+ripper13.h1n1.cv <- evaluate_Weka_classifier(ripper13.h1n1, numFolds=10, seed=2022)
+ripper13.h1n1.cv
+# Predicciones sobre el conjunto de test
+ripper13.season.preds <- predict(ripper13.h1n1, test.missforest.df, "probability")
+```
+
+A continuación generamos un nuevo modelo para la variable `seasonal_vaccine` reptiendo el mismo procedimiento anterior con los mismos conjuntos de datos. De nuevo este clasificador dispone de unas métricas de calidad bastante altas comparado con los anteriores modelos puesto que tiene una tasa de **aciertos del 79.37% y un coeficiente de Kappa del 56.33%**. Por lo tanto parece que también ha ganado capacidad de predicción al imputar los valores perdidos del conjunto de entrenamiento mediante *Random Forest*. Observando su matriz de confusión podemos notar que se repite el patron de **clasificar erróneamente un porcentaje mayor de muestras positivas**, tal y como ocurre en el modelo anterior.
+
+```{r}
+# Modelo para `seasonal_vaccine` 
+ripper8.season <- JRip(seasonal_vaccine~., train.missforest.both.df %>% select(-h1n1_vaccine))
+# Validación cruzada durante 10 iteraciones
+ripper8.season.cv <- evaluate_Weka_classifier(ripper8.season, numFolds=10, seed=2022)
+ripper8.season.cv
+# Predicciones sobre el conjunto de test
+ripper8.season.preds <- predict(ripper13.season, test.missforest.df, "probability")
+
+# Generamos el fichero de probabilidades sobre el conjunto de test
+create.probs.files(ripper13.season.preds[,2], ripper8.season.preds[,2])
+```
+
+Tras experimentar cierta mejora en los clasificadores anteriores al utilizar los conjuntos de datos imputados con *Random Forest*, vamos a integrar otra de las técnicas que mejores resultados han proporcionado en la selección de características: el PCA. Como podemos apreciar en el siguiente gráfico, **la primera dimensión ya incluye más del 42% de la explicabilidad de los datos, mientras que con las dos primeras disponemos de un 74.3%**. Estos porcentajes son considerablemente más altos que los que obtuvimos con el dataset de entrenamiento sin imputar.
+
+```{r}
+# Convertimos todas las variables a numéricas
+train.missforest.nums.df <- data.frame(sapply(c(1:ncol(train.missforest.both.df)), 
+                                   function(x) as.numeric(train.missforest.both.df[, x])))
+# Establecemos los nombres de las columnas
+colnames(train.missforest.nums.df) <- colnames(train.missforest.both.df)
+# PCA basado en la descomposición espectral de variables
+train.missforest.pca <- prcomp(train.missforest.nums.df 
+                               %>% select(-h1n1_vaccine, -seasonal_vaccine))
+# Representación del nivel de información según se reduce la dimensionalidad
+fviz_eig(train.missforest.pca, addlabels=TRUE)
+```
+
+En primer lugar entrenamos un nuevo modelo para predecir la variable `h1n1_vaccine` a partir del conjunto de datos que se puede obtener tras aplicar PCA sobre el dataset de entrenamiento imputado con *Random Forest*. De nuevo, utilizamos validación cruzada durante 10 iteraciones para obtener la tasa media de aciertos. Para este primer modelo es de un **79.92% de precisión con un coeficiente de Kappa del 58.82%**. Si bien los valores de sendas métricas son muy similares al anterior modelo entrenado con el conjunto de datos sin aplicar PCA, en la matriz de confusión se **refuerza la tendencia a clasificar erróneamente muestras positivas** como negativas. Por lo tanto, parece que combinar linealmente las variables no sirve de ayuda para mejorar la capacidad de generalización de este modelo.
+
+```{r}
+# Obtenemos un nuevo dataset tras aplicar PCA sobre entrenamiento
+train.missforest.pca.df <- data.frame(predict(train.missforest.pca, train.missforest.nums.df))
+# Añadimos las dos variables independientes
+train.missforest.pca.df$h1n1_vaccine <- as.factor(train.missforest.nums.df$h1n1_vaccine)
+train.missforest.pca.df$seasonal_vaccine <- as.factor(train.missforest.nums.df$seasonal_vaccine)
+# Obtenemos un nuevo dataset tras aplicar PCA sobre test
+test.missforest.nums.df <- data.frame(sapply(c(1:ncol(test.missforest.df)), 
+                                   function(x) as.numeric(test.missforest.df[, x])))
+colnames(test.missforest.nums.df) <- colnames(test.missforest.df)
+test.missforest.pca.df <- data.frame(predict(train.missforest.pca, test.missforest.nums.df))
+
+# Modelo solo para la variable `h1n1_vaccine` 
+ripper14.h1n1 <- JRip(h1n1_vaccine~., train.missforest.pca.df %>% 
+                        select(-seasonal_vaccine))
+# Aplicamos validación cruzada durante 10 iteraciones sobre entrenamiento
+ripper14.h1n1.cv <- evaluate_Weka_classifier(ripper14.h1n1, numFolds=10, seed=2022)
+ripper14.h1n1.cv
+# Predicciones sobre el conjunto de test
+ripper14.h1n1.preds <- predict(ripper14.h1n1, test.missforest.pca.df, "probability")
+```
+
+El segundo clasificador que predice la otra variable independiente denominada `season_vaccine` también dispone de una calidad muy similar a su homólogo sin PCA con una tasa de **aciertos del 79.45% y un coeficiente de Kappa del 55.57%**. Adicionalmente, en la matriz de confusión podemos observar un decremento considerable del número de muestras positivas correctamente clasificadas a la vez que un incremento del número de ejemplares positivos bien clasificados, por lo que parece que **este modelo se encuentra bajo cierta influencia de esta última clase**. Esto provoca que también aumenten el número de muestras erróneamente clasificadas como positivas.
+
+```{r}
+# Modelo para `seasonal_vaccine` con el dataset imputado con MissForest
+ripper9.season <- JRip(seasonal_vaccine~., train.missforest.pca.df %>% select(-h1n1_vaccine))
+# Validación cruzada durante 10 iteraciones
+ripper9.season.cv <- evaluate_Weka_classifier(ripper9.season, numFolds=10, seed=2022)
+ripper9.season.cv
+# Predicciones sobre el conjunto de test
+ripper9.season.preds <- predict(ripper9.season, test.missforest.pca.df, "probability")
+
+# Generamos el fichero de probabilidades sobre el conjunto de test
+create.probs.files(ripper14.h1n1.preds[,2], ripper9.season.preds[,2])
+```
+
+### MissForest con información
+
+En esta última sección de imputación procedemos a cargar un nuevo conjunto de datos que almacena tanto entrenamiento como test. Este dataset ha sido **imputado utilizando la información que hemos podido encontrar en Internet** acerca de las diferentes variables, además de la función `missForest` para reemplazar los valores perdidos faltantes. Por lo tanto el dataset resultante es diferente del anterior puesto que cuenta con información buscada por el equipo para intentar **imputar los valores perdidos con más conocimiento** de modo que sean lo más realistas posibles. Tras leer el fichero, a continuación separamos los datos de entrenamiento que se encuentran al principio del conjunto de test cuyas filas se sitúan al final. Finalmente añadimos las dos variables independientes al dataset de entrenamiento resultante.
+
+```{r}
+# Cargamos un dataset con el conjunto de entrenamiento y test imputados
+missforest.info.df <- read.csv("datos_manual_MissForest 7-1-2022.csv")
+# Los primeros registros son de entrenamiento
+train.missforest.info.df <- missforest.info.df[1:nrow(train.df), ]
+# Añadimos las dos variables independientes originales al dataset de entrenamiento
+train.missforest.info.df$h1n1_vaccine <- train.df$h1n1_vaccine
+train.missforest.info.df$seasonal_vaccine <- train.df$seasonal_vaccine
+dim(train.missforest.info.df)
+# Los restantes son de test
+test.missforest.info.df <- missforest.info.df[(nrow(train.df)+1):nrow(missforest.info.df), ]
+dim(test.missforest.info.df)
+```
+Como en los casos anteriores, vamos a balancear las clases de la variable `h1n1_vaccine` para que los clasificadores no se encuentren demasiado influenciados por la clase mayoritaria. Para ello aplicamos tanto *oversampling* como *undersampling*, puesto que es la combinación que mejores resultados ha proporcionado hasta el momento. De este modo obtenemos un conjunto de muestras equivalente a la sección anterior con **13.303 ejemplares negativos y 13.404 positivos**.
+
+```{r}
+# Aplicamos undersampling y oversampling a la variable `h1n1_vaccine`
+train.missforest.info.both.df <- ovun.sample(h1n1_vaccine~., 
+                 data=train.missforest.info.df, method="both", seed=2022)$data
+# Dimensiones del nuevo dataset
+dim(train.missforest.info.both.df)
+# Número de instancias para cada clase
+summary(as.factor(train.missforest.info.both.df$h1n1_vaccine))
+```
+A continuación entrenamos un primer modelo para predecir la variable balanceada anteriormente para comprobar si con este nuevo dataset consiguimos un clasificador con mayor capacidad de predicción. Según los resultados podemos apreciar que la tasa de **aciertos es del 79.33% y el coeficiente de Kappa se encuentra en torno al 58.64%**. Estos valores son similares a los proporcionados por el clasificador entrenado para la misma variable pero con los datos imputados únicamente con *Random Forest*, por lo que parece que disponer de información particular a cada variable no ha proporcionado una mejora significativa en este modelo. De nuevo, podemos observar la misma tendencia de **clasificar un mayor número de muestras positivas de forma errónea**.
+
+```{r}
+# Modelo para `h1n1_vaccine` 
+ripper15.h1n1 <- JRip(as.factor(h1n1_vaccine)~.,
+                    train.missforest.info.both.df %>% select(-seasonal_vaccine))
+# Validación cruzada durante 10 iteraciones
+ripper15.h1n1.cv <- evaluate_Weka_classifier(ripper15.h1n1, numFolds=10, seed=2022)
+ripper15.h1n1.cv
+# Predicciones sobre el conjunto de test
+ripper15.h1n1.preds <- predict(ripper15.h1n1, test.missforest.info.df, "probability")
+```
+En segundo lugar entrenamos un clasificador particular a la variable `seasonal_vaccine` con el mismo conjunto de entrenamiento utilizado en el modelo anterior. En este caso sí se produce una ligera mejora tanto en la **tasa de aciertos, que aumenta hasta un 80%, como en el coeficiente de Kappa que se traduce en un 57.75%**. Por lo tanto, parece que este clasificador ha sido el que mejores métricas de calidad ha proporcionado de entre todas las técnicas de imputación probadas hasta el momento. No obstante, si analizamos la matriz de confusión podemos apreciar la presencia de la **misma tendencia anterior pero más acentuada**.
+
+```{r}
+# Modelo para `seasonal_vaccine` con el dataset imputado con MissForest
+ripper10.season <- JRip(as.factor(seasonal_vaccine)~., 
+                    train.missforest.info.both.df %>% select(-h1n1_vaccine))
+# Validación cruzada durante 10 iteraciones
+ripper10.season.cv <- evaluate_Weka_classifier(ripper10.season, numFolds=10, seed=2022)
+ripper10.season.cv
+# Predicciones sobre el conjunto de test
+ripper10.season.preds <- predict(ripper10.season, test.missforest.info.df, "probability")
+
+# Generamos el fichero de probabilidades sobre el conjunto de test
+create.probs.files(ripper15.h1n1.preds[,2], ripper10.season.preds[,2])
+```
+
+Como ha ocurrido en los casos anteriores, a continuación vamos a integrar la mejor técnica de selección de características obtenida hasta el momento para aplicarla al conjunto de entrenamiento imputado con información sobre las variables y con *Random Forest*. Tal y como podemos apreciar en el siguiente gráfico, las dimensiones almacenan un porcentaje de explicabilidad muy similar a la sección anterior por lo que podemos intuir que los resultados de los siguientes clasificadores también serán muy semejantes. 
+
+```{r}
+# Convertimos todas las variables a numéricas
+train.missforest.info.nums.df <- data.frame(sapply(c(1:ncol(train.missforest.info.both.df)), 
+                                function(x) as.numeric(train.missforest.info.both.df[, x])))
+# Establecemos los nombres de las columnas
+colnames(train.missforest.info.nums.df) <- colnames(train.missforest.info.both.df)
+# PCA basado en la descomposición espectral de variables
+train.missforest.info.pca <- prcomp(train.missforest.info.nums.df 
+                               %>% select(-h1n1_vaccine, -seasonal_vaccine))
+# Representación del nivel de información según se reduce la dimensionalidad
+fviz_eig(train.missforest.info.pca, addlabels=TRUE)
+```
+
+Obtenemos el conjunto de entrenamiento y de test tras aplicar PCA y balanceamos las clases de la variable `h1n1_vaccine` con la técnica que mejores resultados ha proporcionado hasta el momento: una combinación entre *oversampling* y *undersampling*. Según los resultados obtenidos, este nuevo clasificador dispone de una tasa de **aciertos del 78.91% y un coeficiente de Kappa del 57.8%**. Si bien los valores son similares a los del clasificador entrenado sin PCA podemos notar que han disminuido ambas métricas ligeramente por lo que parece que esta técnica no ha ayudado a mejorar su capacidad predictiva. De hecho si observamos la matriz de confusión, existen un **mayor número de muestras mal clasificadas como positivas**.
+
+```{r}
+# Obtenemos un nuevo dataset tras aplicar PCA sobre entrenamiento
+train.missforest.info.pca.df <- data.frame(predict(train.missforest.info.pca,
+                                                   train.missforest.info.nums.df))
+# Añadimos las dos variables independientes
+train.missforest.info.pca.df$h1n1_vaccine <- 
+                          as.factor(train.missforest.info.nums.df$h1n1_vaccine)
+train.missforest.info.pca.df$seasonal_vaccine <-
+                          as.factor(train.missforest.info.nums.df$seasonal_vaccine)
+# Obtenemos un nuevo dataset tras aplicar PCA sobre test
+test.missforest.info.nums.df <- data.frame(sapply(c(1:ncol(test.missforest.info.df)), 
+                                   function(x) as.numeric(test.missforest.info.df[, x])))
+colnames(test.missforest.info.nums.df) <- colnames(test.missforest.info.df)
+test.missforest.info.pca.df <- data.frame(predict(train.missforest.info.pca,
+                                                  test.missforest.info.nums.df))
+
+# Modelo solo para la variable `h1n1_vaccine` 
+ripper16.h1n1 <- JRip(as.factor(h1n1_vaccine)~., 
+                    train.missforest.info.pca.df %>% select(-seasonal_vaccine))
+# Aplicamos validación cruzada durante 10 iteraciones sobre entrenamiento
+ripper16.h1n1.cv <- evaluate_Weka_classifier(ripper16.h1n1, numFolds=10, seed=2022)
+ripper16.h1n1.cv
+# Predicciones sobre el conjunto de test
+ripper16.h1n1.preds <- predict(ripper16.h1n1, test.missforest.info.pca.df, "probability")
+```
+
+Finalmente hemos construido un segundo clasificador a partir del mismo conjunto de entrenamiento y test aunque orientado a predecir la variable `season_vaccine`. Tras aplicar el procedimiento anterior podemos observar que ha conseguido un **79.12% de precisión y un 54.82% de coeficiente de Kappa**. En este casa el decremento de ambas medidas de calidad es algo más acusado con respecto al modelo generado sin aplicar PCA. De hecho, parece que en la matriz de confusión existe un **menor número de muestras clasificadas como positivas** lo que incrementa el número de errores.
+
+```{r}
+# Modelo para `seasonal_vaccine`
+ripper11.season <- JRip(as.factor(seasonal_vaccine)~., 
+                        train.missforest.info.pca.df %>% select(-h1n1_vaccine))
+# Validación cruzada durante 10 iteraciones
+ripper11.season.cv <- evaluate_Weka_classifier(ripper11.season, numFolds=10, seed=2022)
+ripper11.season.cv
+# Predicciones sobre el conjunto de test
+ripper11.season.preds <- predict(ripper11.season, test.missforest.info.pca.df, "probability")
+
+# Generamos el fichero de probabilidades sobre el conjunto de test
+create.probs.files(ripper16.h1n1.preds[,2], ripper11.season.preds[,2])
+```
+
+### Conclusiones
+
+Tras los diferentes experimentos que se han realizado con diversas técnicas para imputar valores perdidos, hemos podido observar que reemplazar valores mediante *Random Forest* en los conjuntos de entrenamiento y test han proporcionado los mejores modelos para sendas variables independientes. En el caso de **`h1n1_vaccine` la combinación entre *oversampling* y *undersampling*, PCA y la imputación mediante la función `missForest`** han generado el clasificador con mejor capadidad de predicción. Mientras que para la variable **`seasonal_vaccine` ha sido necesario disponer de información adicional *online* ** para imputar parcialmente algunos valores de forma manual. No obstante, la imputación mediante el algoritmo KNN también ha resultado en modelos con mejores métricas de calidad que sin aplicar esta técnica de preprocesamiento. Por lo tanto, parece ser que **es de gran utilidad generar valores sintéticos para reemplazar los datos perdidos de entrenamiento y test**.
+
+## Ensembles
+
+En esta última sección el objetivo consiste en entrenar varios clasificadores de modo que la combinación de la información extraída ayuden a mejorar la capacidad de predicción que conocemos hasta el momento. En este primer ejemplo se puede entrenar un *ensemble* para cada variable independiente compuesto por un total de **100 o 200 clasificadores generados mediante validación cruzada** y utilizando el conjunto de entrenamiento y test **imputado con el algoritmo KNN**. Adicionalmente, las clases de la **variable `h1n1_vaccine` se encuentran balanceadas mediante *oversampling* y *undersampling* aleatorio**. Durante el proceso se almacenan cada una de las predicciones realizadas por los clasificadores en una matriz para posteriormente realizar la **media de las mismas y obtener las probabilidades finales**.
+
+```{r}
+# Matriz para almacenar las predicciones de cada uno de los clasificadores
+# para la variable h1n1_vaccine
+h1n1.matrix <- c()
+# Número de clasificadores basados en reglas a entrenar 
+## 100 o 200
+for(i in 1:100) {
+    # Selección aleatoria de 6, 16, 18 o 24 columnas
+    random.columns <- sample(32, 16, replace=FALSE)
+    # Clasificador basado en reglas para h1n1_vaccine
+    ripper.h1n1.ensemble <- JRip(as.factor(h1n1_vaccine)~., 
+                                 train.knn.both.df %>% 
+                                   select(all_of(random.columns), h1n1_vaccine))
+    # Validación cruzada con 10 particiones 
+    # Semilla para que los resultados sean reproducibles
+    evaluate_Weka_classifier(ripper.h1n1.ensemble, numFolds=10, seed=2022)
+    # Predicción sobre el conjunto de test
+    ripper.h1n1.ensemble.preds <- predict(ripper.h1n1.ensemble, 
+                                  test.knn.df, "probability")[,2]
+    # Almacenamos la probabilidad de que sea 1 en una matriz para cada clasificador
+    h1n1.matrix <- cbind(h1n1.matrix, as.numeric(as.character(ripper.h1n1.ensemble.preds)))
+}
+# Media de las probabilidades obtenidas por todos los clasificadores
+ripper.h1n1.ensemble.avg.preds <- apply(h1n1.matrix, 1, mean)
+
+# Matriz para almacenar las predicciones de cada uno de los clasificadores
+# para la variable seasonal_vaccine
+season.matrix <- c()
+# Número de clasificadores basados en reglas a entrenar 
+## 100 o 200
+for(i in 1:100) {
+    # Selección aleatoria de 6, 16, 18 o 24 columnas
+    random.columns <- sample(32, 16, replace=FALSE)
+    # Clasificador basado en reglas para seasonal_vaccine
+    ripper.season.ensemble <- JRip(as.factor(seasonal_vaccine)~., 
+                                 train.knn.both.df %>% 
+                                 select(all_of(random.columns), seasonal_vaccine))
+    # Validación cruzada con 10 particiones 
+    # Semilla para que los resultados sean reproducibles
+    evaluate_Weka_classifier(ripper.season.ensemble, numFolds=10, seed=2022)
+    # Predicción sobre el conjunto de test
+    ripper.season.ensemble.preds <- predict(ripper.season.ensemble, 
+                                  test.knn.df, "probability")[,2]
+    # Almacenamos la probabilidad de que sea 1 en una matriz para cada clasificador
+    season.matrix <- cbind(season.matrix,
+                           as.numeric(as.character(ripper.season.ensemble.preds)))
+}
+# Media de las probabilidades obtenidas por todos los clasificadores
+ripper.season.ensemble.avg.preds <- apply(season.matrix, 1, mean)
+# Generamos el fichero de probabilidades de todos los ensembles
+create.probs.files(ripper.h1n1.ensemble.avg.preds, ripper.season.ensemble.avg.preds)
+```
+
+En este segundo `chunk` del apartado actual se encuentra el código asociado al entrenamiento de un *ensemble* para cada variable independiente utilizando el mismo conjunto anterior además de aplicar PCA para comprobar si el comportamiento difiere con respecto al caso anterior. 
+
+```{r}
+# Matriz para almacenar las predicciones de cada uno de los clasificadores
+# para la variable h1n1_vaccine
+h1n1.matrix <- c()
+# Número de clasificadores basados en reglas a entrenar 
+## 100 o 200
+for(i in 1:100) {
+    # Selección aleatoria de 6, 16, 18 o 24 columnas
+    random.columns <- sample(32, 6, replace=FALSE)
+    # Clasificador basado en reglas para h1n1_vaccine
+    ripper.h1n1.ensemble <- JRip(as.factor(h1n1_vaccine)~., 
+                                 train.knn.pca.df %>% 
+                                   select(all_of(random.columns), h1n1_vaccine))
+    # Validación cruzada con 10 particiones 
+    # Semilla para que los resultados sean reproducibles
+    evaluate_Weka_classifier(ripper.h1n1.ensemble, numFolds=10, seed=2022)
+    # Predicción sobre el conjunto de test
+    ripper.h1n1.ensemble.preds <- predict(ripper.h1n1.ensemble, 
+                                  test.knn.pca.df, "probability")[,2]
+    # Almacenamos la probabilidad de que sea 1 en una matriz para cada clasificador
+    h1n1.matrix <- cbind(h1n1.matrix, as.numeric(as.character(ripper.h1n1.ensemble.preds)))
+}
+# Media de las probabilidades obtenidas por todos los clasificadores
+ripper.h1n1.ensemble.avg.preds <- apply(h1n1.matrix, 1, mean)
+
+# Matriz para almacenar las predicciones de cada uno de los clasificadores
+# para la variable seasonal_vaccine
+season.matrix <- c()
+# Número de clasificadores basados en reglas a entrenar 
+## 100 o 200
+for(i in 1:100) {
+    # Selección aleatoria de 6, 16, 18 o 24 columnas
+    random.columns <- sample(32, 6, replace=FALSE)
+    # Clasificador basado en reglas para seasonal_vaccine
+    ripper.season.ensemble <- JRip(as.factor(seasonal_vaccine)~., 
+                                 train.knn.pca.df %>% 
+                                 select(all_of(random.columns), seasonal_vaccine))
+    # Validación cruzada con 10 particiones 
+    # Semilla para que los resultados sean reproducibles
+    evaluate_Weka_classifier(ripper.season.ensemble, numFolds=10, seed=2022)
+    # Predicción sobre el conjunto de test
+    ripper.season.ensemble.preds <- predict(ripper.season.ensemble, 
+                                  test.knn.pca.df, "probability")[,2]
+    # Almacenamos la probabilidad de que sea 1 en una matriz para cada clasificador
+    season.matrix <- cbind(season.matrix,
+                           as.numeric(as.character(ripper.season.ensemble.preds)))
+}
+# Media de las probabilidades obtenidas por todos los clasificadores
+ripper.season.ensemble.avg.preds <- apply(season.matrix, 1, mean)
+# Generamos el fichero de probabilidades sobre el conjunto de test
+create.probs.files(ripper.h1n1.ensemble.avg.preds, ripper.season.ensemble.avg.preds)
+```
+
+Existe un tercer caso en el que se ha utilizado la misma configuración anterior para el entrenamiento conjunto de 100 clasificadores para cada variable indpendiente solo que a continuación utilizamos el **conjunto de entrenamiento y test imputado con *MissForest* **. De nuevo las clases de la variable `h1n1_vaccine` han sido balanceadas mediante *oversampling* y *undersampling* aleatorio.
+
+```{r}
+# Matriz para almacenar las predicciones de cada uno de los clasificadores
+# para la variable h1n1_vaccine
+h1n1.matrix <- c()
+# Número de clasificadores basados en reglas a entrenar 
+for(i in 1:100) {
+    # Selección aleatoria de 6 o 16 columnas
+    random.columns <- sample(32, 16, replace=FALSE)
+    # Clasificador basado en reglas para h1n1_vaccine
+    ripper.h1n1.ensemble <- JRip(h1n1_vaccine~., 
+                                 train.missforest.both.df %>% 
+                                   select(all_of(random.columns), h1n1_vaccine))
+    # Validación cruzada con 10 particiones 
+    # Semilla para que los resultados sean reproducibles
+    evaluate_Weka_classifier(ripper.h1n1.ensemble, numFolds=10, seed=2022)
+    # Predicción sobre el conjunto de test
+    ripper.h1n1.ensemble.preds <- predict(ripper.h1n1.ensemble, 
+                                  test.missforest.df, "probability")[,2]
+    # Almacenamos la probabilidad de que sea 1 en una matriz para cada clasificador
+    h1n1.matrix <- cbind(h1n1.matrix, as.numeric(as.character(ripper.h1n1.ensemble.preds)))
+}
+# Media de las probabilidades obtenidas por todos los clasificadores
+ripper.h1n1.ensemble.avg.preds <- apply(h1n1.matrix, 1, mean)
+
+# Matriz para almacenar las predicciones de cada uno de los clasificadores
+# para la variable seasonal_vaccine
+season.matrix <- c()
+# Número de clasificadores basados en reglas a entrenar 
+for(i in 1:100) {
+    # Selección aleatoria de 6 o 16 columnas
+    random.columns <- sample(32, 16, replace=FALSE)
+    # Clasificador basado en reglas para seasonal_vaccine
+    ripper.season.ensemble <- JRip(seasonal_vaccine~., 
+                                 train.missforest.both.df %>% 
+                                 select(all_of(random.columns), seasonal_vaccine))
+    # Validación cruzada con 10 particiones 
+    # Semilla para que los resultados sean reproducibles
+    evaluate_Weka_classifier(ripper.season.ensemble, numFolds=10, seed=2022)
+    # Predicción sobre el conjunto de test
+    ripper.season.ensemble.preds <- predict(ripper.season.ensemble, 
+                                  test.missforest.df, "probability")[,2]
+    # Almacenamos la probabilidad de que sea 1 en una matriz para cada clasificador
+    season.matrix <- cbind(season.matrix,
+                           as.numeric(as.character(ripper.season.ensemble.preds)))
+}
+# Media de las probabilidades obtenidas por todos los clasificadores
+ripper.season.ensemble.avg.preds <- apply(season.matrix, 1, mean)
+# Generamos el fichero de probabilidades sobre el conjunto de test
+create.probs.files(ripper.h1n1.ensemble.avg.preds, ripper.season.ensemble.avg.preds)
+```
+
+Adicionalmente **aplicamos PCA** al conjunto de entrenamiento anterior utilizando la misma configuración para ambos *ensembles* con el objetivo de comprobar si aumenta la capacidad predictiva al combinar linealmente la información que aportan cada una de las variables de este dataset.
+
+```{r}
+# Matriz para almacenar las predicciones de cada uno de los clasificadores
+# para la variable h1n1_vaccine
+h1n1.matrix <- c()
+# Número de clasificadores basados en reglas a entrenar 
+for(i in 1:100) {
+    # Selección aleatoria de 6 columnas
+    random.columns <- sample(32, 6, replace=FALSE)
+    # Clasificador basado en reglas para h1n1_vaccine
+    ripper.h1n1.ensemble <- JRip(h1n1_vaccine~., 
+                                 train.missforest.pca.df %>% 
+                                   select(all_of(random.columns), h1n1_vaccine))
+    # Validación cruzada con 10 particiones 
+    # Semilla para que los resultados sean reproducibles
+    evaluate_Weka_classifier(ripper.h1n1.ensemble, numFolds=10, seed=2022)
+    # Predicción sobre el conjunto de test
+    ripper.h1n1.ensemble.preds <- predict(ripper.h1n1.ensemble, 
+                                  test.missforest.pca.df, "probability")[,2]
+    # Almacenamos la probabilidad de que sea 1 en una matriz para cada clasificador
+    h1n1.matrix <- cbind(h1n1.matrix, as.numeric(as.character(ripper.h1n1.ensemble.preds)))
+}
+# Media de las probabilidades obtenidas por todos los clasificadores
+ripper.h1n1.ensemble.avg.preds <- apply(h1n1.matrix, 1, mean)
+
+# Matriz para almacenar las predicciones de cada uno de los clasificadores
+# para la variable seasonal_vaccine
+season.matrix <- c()
+# Número de clasificadores basados en reglas a entrenar 
+for(i in 1:100) {
+    # Selección aleatoria de 6 columnas
+    random.columns <- sample(32, 6, replace=FALSE)
+    # Clasificador basado en reglas para seasonal_vaccine
+    ripper.season.ensemble <- JRip(seasonal_vaccine~., 
+                                 train.missforest.pca.df %>% 
+                                 select(all_of(random.columns), seasonal_vaccine))
+    # Validación cruzada con 10 particiones 
+    # Semilla para que los resultados sean reproducibles
+    evaluate_Weka_classifier(ripper.season.ensemble, numFolds=10, seed=2022)
+    # Predicción sobre el conjunto de test
+    ripper.season.ensemble.preds <- predict(ripper.season.ensemble, 
+                                  test.missforest.pca.df, "probability")[,2]
+    # Almacenamos la probabilidad de que sea 1 en una matriz para cada clasificador
+    season.matrix <- cbind(season.matrix,
+                           as.numeric(as.character(ripper.season.ensemble.preds)))
+}
+# Media de las probabilidades obtenidas por todos los clasificadores
+ripper.season.ensemble.avg.preds <- apply(season.matrix, 1, mean)
+# Generamos el fichero de probabilidades sobre el conjunto de test
+create.probs.files(ripper.h1n1.ensemble.avg.preds, ripper.season.ensemble.avg.preds)
+```
+
+Una variante del anterior conjunto de datos imputado con *MissForest* es el reemplazamiento manual de unos pocos valores perdidos en función de cierta información *online* que hemos podido encontrar de algunas variables. Para comprobar las similitudes y diferencias entre el comportamiento de sendos datasets a continuación entrenamos dos ensembles para las dos variables independientes utilizando la misma configuración anterior.
+
+```{r}
+# Matriz para almacenar las predicciones de cada uno de los clasificadores
+# para la variable h1n1_vaccine
+h1n1.matrix <- c()
+# Número de clasificadores basados en reglas a entrenar 
+for(i in 1:100) {
+    # Selección aleatoria de 6 columnas
+    random.columns <- sample(32, 6, replace=FALSE)
+    # Clasificador basado en reglas para h1n1_vaccine
+    ripper.h1n1.ensemble <- JRip(as.factor(h1n1_vaccine)~., 
+                                 train.missforest.info.both.df %>% 
+                                   select(all_of(random.columns), h1n1_vaccine))
+    # Validación cruzada con 10 particiones 
+    # Semilla para que los resultados sean reproducibles
+    evaluate_Weka_classifier(ripper.h1n1.ensemble, numFolds=10, seed=2022)
+    # Predicción sobre el conjunto de test
+    ripper.h1n1.ensemble.preds <- predict(ripper.h1n1.ensemble, 
+                                  test.missforest.info.df, "probability")[,2]
+    # Almacenamos la probabilidad de que sea 1 en una matriz para cada clasificador
+    h1n1.matrix <- cbind(h1n1.matrix, as.numeric(as.character(ripper.h1n1.ensemble.preds)))
+}
+# Media de las probabilidades obtenidas por todos los clasificadores
+ripper.h1n1.ensemble.avg.preds <- apply(h1n1.matrix, 1, mean)
+
+# Matriz para almacenar las predicciones de cada uno de los clasificadores
+# para la variable seasonal_vaccine
+season.matrix <- c()
+# Número de clasificadores basados en reglas a entrenar 
+for(i in 1:100) {
+    # Selección aleatoria de 6 columnas
+    random.columns <- sample(32, 6, replace=FALSE)
+    # Clasificador basado en reglas para h1n1_vaccine
+    ripper.season.ensemble <- JRip(as.factor(seasonal_vaccine)~., 
+                                 train.missforest.info.both.df %>% 
+                                 select(all_of(random.columns), seasonal_vaccine))
+    # Validación cruzada con 10 particiones 
+    # Semilla para que los resultados sean reproducibles
+    evaluate_Weka_classifier(ripper.season.ensemble, numFolds=10, seed=2022)
+    # Predicción sobre el conjunto de test
+    ripper.season.ensemble.preds <- predict(ripper.season.ensemble, 
+                                  test.missforest.info.df, "probability")[,2]
+    # Almacenamos la probabilidad de que sea 1 en una matriz para cada clasificador
+    season.matrix <- cbind(season.matrix,
+                           as.numeric(as.character(ripper.season.ensemble.preds)))
+}
+# Media de las probabilidades obtenidas por todos los clasificadores
+ripper.season.ensemble.avg.preds <- apply(season.matrix, 1, mean)
+# Generamos el fichero de probabilidades sobre el conjunto de test
+create.probs.files(ripper.h1n1.ensemble.avg.preds, ripper.season.ensemble.avg.preds)
+```
+
+Si bien un *ensemble* puede estar compuesto por varios clasificadores utilizando el mismo algoritmo, también se pueden combinar diversas técnicas con el objetivo de que cada una de ellas extraiga las características más relevantes con las que posteriormente obtener las predicciones de sendas variables independientes. En este primer `chunk` vamos a **entrenar 50 clasificadores basados en reglas y 50 clasificadores utilizando uno de los árboles de decisión denominado *Rpart* **. Como conjuntos de datos utilizaremos aquellos cuya imputación de valores nulos se ha realizado con KNN y con un balancead de las clases de `h1n1_vaccine` mediante *oversampling* y *undersampling* aleatorio.
+
+```{r}
+# Matriz para almacenar las predicciones de cada uno de los clasificadores
+# para la variable h1n1_vaccine
+h1n1.matrix <- c()
+for(i in 1:100) {
+    # Selección aleatoria de 16 columnas
+    random.columns <- sample(32, 16, replace=FALSE)
+    # Clasificadores basados en RPART
+    if (i %% 2 == 0) {
+      # Validación cruzada con particiones
+      rpart.h1n1.ensemble <- train(as.factor(h1n1_vaccine)~., 
+                             train.knn.both.df %>% 
+                             select(all_of(random.columns), h1n1_vaccine), 
+                             method = "rpart", trControl = 
+                             trainControl("cv", number = 10), tuneLength = 10)
+      # Predicciones sobre el conjunto de test
+      rpart.h1n1.ensemble.preds <- predict(rpart.h1n1.ensemble, 
+                                  test.knn.df, "prob")[,2]
+      # Almacenamos las predicciones de todos los clasificadores en una matriz
+      h1n1.matrix <- cbind(h1n1.matrix, as.numeric(as.character(rpart.h1n1.ensemble.preds)))
+    }
+    # Clasificadores basados en reglas
+    else {
+      ripper.h1n1.ensemble <- JRip(as.factor(h1n1_vaccine)~., 
+                                 train.knn.both.df %>% 
+                                   select(all_of(random.columns), h1n1_vaccine))
+      # Validación cruzada de 10 particiones
+      evaluate_Weka_classifier(ripper.h1n1.ensemble, numFolds=10, seed=2022)
+      # Predicciones sobre el conjunto de test
+      ripper.h1n1.ensemble.preds <- predict(ripper.h1n1.ensemble, 
+                                    test.knn.df, "probability")[,2]
+      # Almacenamos las predicciones de todos los clasificadores en una matriz
+      h1n1.matrix <- cbind(h1n1.matrix, as.numeric(as.character(ripper.h1n1.ensemble.preds)))
+    }
+}
+# Media de las probabilidades obtenidas por todos los clasificadores
+ripper.h1n1.ensemble.avg.preds <- apply(h1n1.matrix, 1, mean)
+
+# Matriz para almacenar las predicciones de cada uno de los clasificadores
+# para la variable seasonal_vaccine
+season.matrix <- c()
+for(i in 1:100) {
+    # Selección aleatoria de 16 columnas
+    random.columns <- sample(32, 16, replace=FALSE)
+    # Clasificadores basados en RPART
+    if (i %% 2 == 0) {
+      # Validación cruzada con particiones
+      rpart.season.ensemble <- train(as.factor(seasonal_vaccine)~., 
+                              train.knn.both.df %>% 
+                               select(all_of(random.columns), seasonal_vaccine), 
+                               method = "rpart", trControl = 
+                              trainControl("cv", number = 10), tuneLength = 10)
+      # Predicciones sobre el conjunto de test
+      rpart.season.ensemble.preds <- predict(rpart.season.ensemble, 
+                                  test.knn.df, "prob")[,2]
+      # Almacenamos las predicciones de todos los clasificadores en una matriz
+      season.matrix <- cbind(h1n1.matrix, 
+                             as.numeric(as.character(rpart.season.ensemble.preds)))
+    }
+    else {
+      ripper.season.ensemble <- JRip(as.factor(seasonal_vaccine)~., 
+                                   train.knn.both.df %>% 
+                                   select(all_of(random.columns), seasonal_vaccine))
+      # Validación cruzada de 10 particiones
+      evaluate_Weka_classifier(ripper.season.ensemble, numFolds=10, seed=2022)
+      # Predicciones sobre el conjunto de test
+      ripper.season.ensemble.preds <- predict(ripper.season.ensemble, 
+                                    test.knn.df, "probability")[,2]
+      # Almacenamos las predicciones de todos los clasificadores en una matriz
+      season.matrix <- cbind(season.matrix,
+                             as.numeric(as.character(ripper.season.ensemble.preds)))
+    }
+}
+# Media de las probabilidades obtenidas por todos los clasificadores
+ripper.season.ensemble.avg.preds <- apply(season.matrix, 1, mean)
+# Generamos el fichero de probabilidades sobre el conjunto de test
+create.probs.files(ripper.h1n1.ensemble.avg.preds, ripper.season.ensemble.avg.preds)
+```
+
+En este último `chunk` procedemos a combinar la información que son capaces de extraer **50 clasificadores basados en reglas y 50 modelos utilizando el otro algoritmo de árboles de decisión disponible conocido como C4.5**. Como en el caso anterior, utilizamos la misma configuración aplicando validación cruzada con 10 particiones para cada uno de los clasificadores y el dataset resultante de imputar los valores perdidos con KNN y de balancear las clases de la variable `h1n1_vaccine` con *oversampling* y *undersampling* aleatorio.
+
+```{r}
+h1n1.matrix <- c()
+for(i in 1:100) {
+    random.columns <- sample(32, 16, replace=FALSE)
+    if (i %% 2 == 0) {
+      j48.h1n1.ensemble <- train(as.factor(h1n1_vaccine)~., 
+                                 train.knn.both.df %>% 
+                                   select(all_of(random.columns), h1n1_vaccine), 
+                                   method = "J48", trControl = trainControl("cv", number = 10),
+                                   tuneLength = 10)
+      j48.h1n1.ensemble.preds <- predict(j48.h1n1.ensemble, 
+                                  test.knn.df, "prob")[,2]
+      h1n1.matrix <- cbind(h1n1.matrix, as.numeric(as.character(j48.h1n1.ensemble.preds)))
+    }
+    else {
+      ripper.h1n1.ensemble <- JRip(as.factor(h1n1_vaccine)~., 
+                                 train.knn.both.df %>% 
+                                   select(all_of(random.columns), h1n1_vaccine))
+      evaluate_Weka_classifier(ripper.h1n1.ensemble, numFolds=10, seed=2022)
+      ripper.h1n1.ensemble.preds <- predict(ripper.h1n1.ensemble, 
+                                    test.knn.df, "probability")[,2]
+      h1n1.matrix <- cbind(h1n1.matrix, as.numeric(as.character(ripper.h1n1.ensemble.preds)))
+    }
+}
+ripper.h1n1.ensemble.avg.preds <- apply(h1n1.matrix, 1, mean)
+
+season.matrix <- c()
+for(i in 1:100) {
+    random.columns <- sample(32, 16, replace=FALSE)
+    if (i %% 2 == 0) {
+      j48.season.ensemble <- train(as.factor(seasonal_vaccine)~., 
+                                 train.knn.both.df %>% 
+                                   select(all_of(random.columns), seasonal_vaccine), 
+                                   method = "J48", trControl = trainControl("cv", number = 10),
+                                   tuneLength = 10)
+      j48.season.ensemble.preds <- predict(j48.season.ensemble, 
+                                  test.knn.df, "prob")[,2]
+      season.matrix <- cbind(h1n1.matrix, 
+                             as.numeric(as.character(j48.season.ensemble.preds)))
+    }
+    else {
+      ripper.season.ensemble <- JRip(as.factor(seasonal_vaccine)~., 
+                                   train.knn.both.df %>% 
+                                   select(all_of(random.columns), seasonal_vaccine))
+      evaluate_Weka_classifier(ripper.season.ensemble, numFolds=10, seed=2022)
+      ripper.season.ensemble.preds <- predict(ripper.season.ensemble, 
+                                    test.knn.df, "probability")[,2]
+      season.matrix <- cbind(season.matrix,
+                             as.numeric(as.character(ripper.season.ensemble.preds)))
+    }
+}
+ripper.season.ensemble.avg.preds <- apply(season.matrix, 1, mean)
+# Generamos el fichero de probabilidades sobre el conjunto de test
+create.probs.files(ripper.h1n1.ensemble.avg.preds, ripper.season.ensemble.avg.preds)
+```

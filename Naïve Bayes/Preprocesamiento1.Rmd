@@ -1,0 +1,179 @@
+---
+title: "Untitled"
+author: "Laura Antequera Pérez"
+date: "2/1/2022"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Introducción
+
+Realizaremos varios preprocesamientos para clasificar el conjunto de datos proporcionado en la competición *Flu Shot Learning: Predict H1N1 and Seasonal Flu Vaccines* de la plataforma *DrivenData*. Posteriormente, usaremos *Naive-Bayes* para realizar dicha clasificación.
+
+De la literatura sabemos cuáles son las ventajas y desventajas de *Naive-Bayes*.
+
+Entre sus fortalezas tenemos que:
+
++ El clasificador naïve Bayes es su simplicidad y eficiencia computacional.
++ Hace un gran trabajo manejando características categóricas directamente, sin ningún procesamiento previo.
++ Suele funcionar mejor que los clasificadores más sofisticados cuando se trabaja con una gran cantidad de predictores.
++ Maneja bastante bien los datos ruidosos y faltantes.
+
+Entre sus debilidades tenemos que:
++ Para obtener un buen rendimiento, Naïve Bayes necesita una cantidad considerable de datos.
++ Debido a la suposición de la independencia condicional de clase, las probabilidades calculadas no son fiables cuando se consideran de forma aislada. La probabilidad calculada de que una instancia pertenezca a una clase particular debe evaluarse en relación con la probabilidad calculada de que la misma instancia pertenezca a otras clases.
++ Asume que todas las características dentro de una clase no solo son independientes sino que son igualmente importantes.
+
+Otro problema derivado del modelo Naive-Bayes es el *Problema de las Cero Observaciones*. El modelo asigna la probabilidad de $0$ cuando se encuentra un atributo con una categoría que no está presente en el conjunto de entrenamiento. Es decir, la probabilidad condicional se vuelve cero y dado que las probabilidades condicionales se multiplican en una cadena, esto hace que todas las probabilidades posteriores que incluyeron el nivel sean cero. Para evitar esto se utiliza el suavizado de laplace.
+
+Para usar Naive-Bayes será muy importante balancear las clases, seleccionar características que no sean redundantes y tener especial cuidado con las que estén correlacionadas. Aunque no sea tan importante para este algoritmo, también trataremos los valores perdidos, al igual que el resto de compañeros de mi grupo.
+
+En este fichero observaremos, a continuación, un primer preprocesamiento básico realizado.
+## Preprocesamiento
+
+```{r message=FALSE, warning=FALSE, include=FALSE}
+library(dplyr)
+library(mice)
+library(caret)
+```
+
+En primer lugar cargaremos los datos disponibles para entrenamiento:
+```{r}
+df <- read.csv("training_set_features.csv")
+
+glimpse(df)
+```
+
+
+Analizamos cuántos *missing values* tenemos por cada variable de nuestro conjunto de datos. Y le prestaremos especial atención a las variables de tipo `char` con comillas vacias.
+```{r}
+#hay filas con NA:
+any(!complete.cases(df))
+
+#En total:
+sum(!complete.cases(df))
+
+map_dbl(df, .f = function(x){sum(is.na(x))})
+
+map_lgl(df, .f = function(x){any(!is.na(x) & x == "")})
+
+```
+
+Indicamos que las comillas vacías son *missing values*:
+```{r}
+df$education[df$education == ""] <- NA
+df$income_poverty[df$income_poverty == ""] <- NA
+df$marital_status[df$marital_status == ""] <- NA
+df$rent_or_own[df$rent_or_own == ""] <- NA
+df$employment_status[df$employment_status == ""] <- NA
+df$employment_industry[df$employment_industry == ""] <- NA
+df$employment_occupation[df$employment_occupation == ""] <- NA
+
+map_dbl(df, .f = function(x){sum(is.na(x))})
+```
+
+Como todas nuestras variables predictivas son categóricas convertimos cada una de ellas a `factor`.
+```{r}
+df <-lapply(df[,1:36],as.factor)
+glimpse(df)
+```
+
+Cargamos también el dataset de las etiquetas del conjunto de entrenamiento
+```{r}
+#cargamos labels
+label <- read.csv("training_set_labels.csv")
+glimpse(label)
+```
+
+Unimos el conjunto de entrenamiento y el de las etiquetas.
+```{r}
+# train + label
+joined_df <- merge(df,label)
+joined_df <- joined_df[,-1]
+summary(joined_df)
+```
+
+Usaremos la medida de *Kruskal y Goodman* para estudiar la fuerza de la asociación de todas las variables categóricas dos a dos. 
+```{r}
+GKmatrix1<- GKtauDataframe(joined_df)
+#plot(GKmatrix1, corrColors = "purple2")
+```
+Observamos que entre las variables predictivas no hay ninguna que tenga un coeficiente *tau* elevado, es decir, una asociación fuerte. Por tanto, no tenemos ninguna variable predictiva que se pueda predecir a partir de otra. Por otro lado, podemos nombrar las variables que presentan una asociación muy débil con las variables respuesta:
+
++ `behavioral_antiviral_meds` (columna 3)
+
++ `behavioral_avoidance` (columna 4)
+
++ `behavioral_face_mask` (columna 5)
+
++ `behavioral_large_gatherings`(columna 6)
+
++ `behavioral_outside_home` (columna 7)
+
++ `child_under_6_months` (columna 13)
+
++ `education` (columna 23)
+
++ `sex` (columna 25)
+
++ `income_poverty` (columna 26)
+
++ `marital_status` (columna 27)
+
++ `hhs_geo_region` (columna 30)
+
++ `census_msa` (columna 31)
+
++ `household_adults` (columna 32)
+
+Estás podrán ser candidatas a eliminarse de nuestro conjunto de datos para ejecutar el algoritmo de clasificación seleccionado. 
+
+
+Realizaremos varias imputaciones con la función `mice`. En este guión usaremos el método *predictive mean matching* (parámetro `method='pmm'`), un método de imputación semiparamétrico. Su principal ventaja es que los valores imputados coinciden con alguno de los
+valores observados en la misma variable.  Una opción es eliminar las tres variables que hemos observado que tienen más del $40$% de *missing values* junto con la variable `respondent_id`.
+```{r}
+#joined_df <- joined_df[,-c(15,34,35)]
+imputed_Data = mice(joined_df, m=5, maxit = 5, method = 'pmm', seed = 500)
+data <- complete(imputed_Data)
+
+map_dbl(data, .f = function(x){sum(is.na(x))})
+```
+
+En este guión, usaremos una de las técnicas más simple para un conjunto multietiqueta denominada *Binary Relevance*, que básicamente trata cada etiqueta como un problema de clasificación de una sola clase por separado. Antes, estudiaremos si las clases están balanceadas o no:
+```{r}
+prop.table(table(data$h1n1_vaccine))
+table(data$h1n1_vaccine)
+prop.table(table(data$seasonal_vaccine))
+table(data$seasonal_vaccine)
+```
+
+Aplicamos **downsampling** pues las clases de la variable `h1n1_vaccine` están desbalanceadas. Para esto tenemos que cargar el paquete `caret` y utilizar la funcion `DownSample()`. La funcion `downSample()` requiere 2 parametros, el primero es el conjunto de datos y el segundo la clase que nos interesa considerar para realizar el downsampling.
+```{r}
+data$h1n1_vaccine <- factor(data$h1n1_vaccine)
+data$seasonal_vaccine <- factor(data$seasonal_vaccine)
+
+data_balanc2 <-downSample(data,data$h1n1_vaccine)
+data_balanc2 %>%group_by(h1n1_vaccine) %>% summarise(total=n())
+data_balanc2 %>%group_by(seasonal_vaccine) %>% summarise(total=n())
+```
+
+Para el algoritmo de clasificación usaremos`data_balanc2` que se corresponde con los datos imputados (sin **NA**) y balanceados (usando la técnica **downsampling**). 
+
+Otra opción es usar `data_balanc1` cuyos datos se han balanceado con un algoritmo híbrido combinando *undersampling* y *oversampling*:
+
+```{r}
+data_balanc1 <- ovun.sample(h1n1_vaccine ~ ., 
+                            data = data, 
+                            method = "both", 
+                            N = table(data$h1n1_vaccine)[1])$data
+
+table(data_balanc1$h1n1_vaccine)
+table(data_balanc1$seasonal_vaccine)
+prop.table(table(data_balanc1$seasonal_vaccine))
+```
+
+
+

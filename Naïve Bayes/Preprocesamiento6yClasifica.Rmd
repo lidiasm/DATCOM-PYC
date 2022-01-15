@@ -1,0 +1,208 @@
+---
+title: "Preprocesamiento6"
+author: "Laura Antequera Pérez"
+date: "4/1/2022"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Preprocesamiento
+
+```{r message=FALSE, warning=FALSE, include=FALSE}
+library(dplyr)
+library(mice)
+library(caret)
+library(purrr)
+library(mice)
+library(ROSE)
+library(caret)
+library(naivebayes)
+library(GoodmanKruskal)
+library(e1071)
+library(ggplot2)
+```
+
+En primer lugar cargaremos los datos disponibles para entrenamiento y las etiquetas:
+```{r}
+df <- read.csv("training_set_features.csv")
+
+glimpse(df)
+
+
+label <- read.csv("training_set_labels.csv")
+glimpse(label)
+```
+
+
+Indicamos que las comillas vacías son *missing values*:
+```{r}
+df$education[df$education == ""] <- NA
+df$income_poverty[df$income_poverty == ""] <- NA
+df$marital_status[df$marital_status == ""] <- NA
+df$rent_or_own[df$rent_or_own == ""] <- NA
+df$employment_status[df$employment_status == ""] <- NA
+df$employment_industry[df$employment_industry == ""] <- NA
+df$employment_occupation[df$employment_occupation == ""] <- NA
+
+map_dbl(df, .f = function(x){sum(is.na(x))})
+```
+
+Como a continuación vamos a estudiar el comportamiento de los atributos con las dos variables respuesta, vamos a unir ambas etiquetas en una única variable para poder reliazar uno de los estudios de filtrado.
+```{r}
+#Unimos las dos etiquetas
+label_conjunta <- label %>% mutate(conjunta = ifelse(h1n1_vaccine==0,ifelse(seasonal_vaccine==0,1,2),ifelse(seasonal_vaccine==0,3,4)))
+
+etiquetas <- factor(label_conjunta[,4])
+table(etiquetas)
+```
+
+```{r}
+joined_df = cbind(df,etiquetas)
+glimpse(joined_df)
+```
+
+```{r}
+# Eliminamos la variable respondent_id
+joined_df <- joined_df[,-1]
+joined_df <-lapply(joined_df[,1:36],as.factor)
+joined_df <- as.data.frame(joined_df)
+```
+
+La detección de ruido resulta esencial para algunos algoritmos muy sensibles.
+Veremos un ejemplo de aplicación con un algoritmo muy característico: **Iterative Partitioning Filter** implementado en el
+paquete `NoiseFiltersR`. Se basa en identificar instancias en los que los valores de alguna(s) variable(s) no se corresponde con lo esperado. Se construye un clasificador base en cada una de las `nfolds`particiones de `data`. Luego, se prueban en todo el conjunto de datos y la eliminación de instancias ruidosas se decide mediante esquemas de votación por consenso o por mayoría. Finalmente, una proporción de buenas instancias (es decir, aquellas cuya etiqueta concuerda con todos los clasificadores base) se almacena y se elimina para la siguiente iteración. El proceso se detiene después de siteraciones en las que no se han peliminado suficientes instancias ruidosas (según la proporción ). En esta implementación, el clasificador base utilizado es C4.5.
+
+```{r}
+library(NoiseFiltersR)
+set.seed(1)
+resultado <- NoiseFiltersR::IPF(etiquetas ~ ., data=joined_df, s=2)
+```
+
+Nos quedamos con el dataset limpio de ruido, observemos sus dimensiones y los *missing values* por cada atributo:
+```{r}
+joined_dfClean <- resultado$cleanData
+dim(joined_dfClean)
+map_dbl(joined_dfClean, .f = function(x){sum(is.na(x))})
+```
+
+A continuación, vamos a eliminar aquellas filas que posean más de dos valores perdidos o *missing values*
+```{r}
+delete.na <- function(DF, n=4) {
+  DF[rowSums(is.na(DF)) <= n,]
+}
+
+datos <- delete.na(joined_dfClean)
+
+glimpse(datos)
+map_dbl(datos, .f = function(x){sum(is.na(x))})
+table(datos$etiquetas)
+``` 
+
+En esta ocasión, vamos a imputar los valores perdidos mediante un árbol de clasificación si la variable es categórica, y si la variable es continua aplica un árbol de regresión asi que como únicamente tenemos categóricas no usará regresión. Antes, seleccionaremos las $8$ variables más importantes que analizamos en el fichero *Preprocesamiento5.Rmd*.
+
+```{r}
+datosBest8 <- datos[,c(10,11,15,16,17,19,20,22,36)]
+imputed_Data = mice(datosBest8, m=5, maxit = 5, method = 'cart', seed = 500)
+train_clean <- complete(imputed_Data)
+
+train_clean <- as.data.frame(train_clean)
+
+map_dbl(train_clean, .f = function(x){sum(is.na(x))})
+
+```
+
+```{r}
+#Cargamos test
+test <- read.csv("test_set_features.csv")
+respondent_id <- test[,1]
+test <- test[,-1]
+
+test$education[test$education == ""] <- NA
+test$income_poverty[test$income_poverty == ""] <- NA
+test$marital_status[test$marital_status == ""] <- NA
+test$rent_or_own[test$rent_or_own == ""] <- NA
+test$employment_status[test$employment_status == ""] <- NA
+test$employment_industry[test$employment_industry == ""] <- NA
+test$employment_occupation[test$employment_occupation == ""] <- NA
+
+map_dbl(test, .f = function(x){sum(is.na(x))})
+
+glimpse(test)
+test <-lapply(test[,1:35],as.factor)
+test <- as.data.frame(test)
+
+test <- test[,c(10,11,15,16,17,19,20,22)]
+```
+
+Imputaremos los valores perdidos haciendo uso de la función `mice` con árboles de decisión.
+```{r}
+imputed_Data = mice(test, m=5, maxit = 5, method = 'cart', seed = 500)
+test_clean <- complete(imputed_Data)
+
+map_dbl(test_clean, .f = function(x){sum(is.na(x))})
+```
+
+
+```{r}
+train <- train_clean %>% mutate(h1n1_vaccine = ifelse(etiquetas==3|etiquetas==4, 1,0), seasonal_vaccine = ifelse(etiquetas==2|etiquetas==4, 1,0))
+#eliminamos la variable conjunta de etiquetas
+train <- train[,-9]
+train$h1n1_vaccine <- factor(train$h1n1_vaccine)
+train$seasonal_vaccine <- factor(train$seasonal_vaccine)
+```
+
+A continuación, usaremos el paquete *ROSE* para el balanceamiento de clases. La función *ROSE* crea una muestra de datos sintéticos ampliando el espacio de características de los ejemplos de clases mayoritarias y minoritarias:
+```{r}
+library(ROSE)
+data_balanced <- ROSE(factor(h1n1_vaccine) ~ ., data = train, seed = 1)$data
+table(data_balanced)
+```
+
+En esta ocasión usaremos el paquete `caret` y entrenaremos el algoritmo de Naive-bayes con una rejilla: validación cruzada de $10$ folds y rango de valores para el suavizado de laplace:
+```{r}
+train_control <- trainControl(
+  method = "cv", 
+  number = 10,
+  verboseIter = TRUE,
+  classProbs=TRUE,
+  summaryFunction = twoClassSummary
+  )
+nb_grid <-   expand.grid(usekernel = c(TRUE, FALSE),
+                         laplace = c(0, 1, 2, 3), 
+                         adjust = c(0.75, 1, 1.25, 1.5))
+#Para usar la metrica ROC necesitamos darle nombre a los level de factor
+data_balanced$h1n1_vaccine <- make.names(data_balanced$h1n1_vaccine)
+data_balanced$seasonal_vaccine <- make.names(data_balanced$seasonal_vaccine)
+data_balanced$seasonal_vaccine <- factor(data_balanced$seasonal_vaccine)
+data_balanced$h1n1_vaccine <- factor(data_balanced$h1n1_vaccine)
+
+naive_bayes_via_caret6 <- train(h1n1_vaccine ~ ., 
+                               data = data_balanced[,-10], 
+                               method = "naive_bayes", 
+                               tuneGrid = nb_grid,
+                               metric="ROC",
+                               trControl = train_control)
+
+h1n1_vacc <- predict(naive_bayes_via_caret6, newdata = test_clean, type = "prob")
+
+naive_bayes_via_caret7 <- train(seasonal_vaccine ~ ., 
+                               data = data_balanced[,-9], 
+                               method = "naive_bayes", 
+                               tuneGrid = nb_grid,
+                               metric="ROC",
+                               trControl = train_control)
+
+seasonal_vacc <- predict(naive_bayes_via_caret7, newdata = test_clean, type = "prob")
+
+submission21 <- data.frame(respondent_id, h1n1_vacc[,2],seasonal_vacc[,2])
+colnames(submission21) <-c('respondent_id', 'h1n1_vaccine', 'seasonal_vaccine')
+
+write.csv(submission21,"C:/Users/Lenovo/OneDrive/Escritorio/Preprocesamiento/Preprocesamiento/submission21.csv", row.names = FALSE)
+```
+
+Obtenemos un score algo por debajo de $0.80$
+
+

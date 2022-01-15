@@ -1,0 +1,354 @@
+---
+title: "Ensemble"
+author: "Laura Antequera Pérez"
+date: "6/1/2022"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Preprocesamiento
+
+El objetivo de este preprocesamiento es preparar el conjunto de entrenamiento con el objetivo de usarlo en un ensemble con selección aleatoria de columnas, con el algoritmo de clasificación de Naive-Bayes, para cada una de las etiquetas. 
+```{r message=FALSE, warning=FALSE, include=FALSE}
+library(dplyr)
+library(mice)
+library(caret)
+library(purrr)
+library(mice)
+library(ROSE)
+library(caret)
+library(naivebayes)
+library(GoodmanKruskal)
+library(e1071)
+library(ggplot2)
+```
+
+En primer lugar cargaremos los datos disponibles para entrenamiento y las etiquetas:
+```{r}
+df <- read.csv("training_set_features.csv")
+
+glimpse(df)
+
+
+label <- read.csv("training_set_labels.csv")
+glimpse(label)
+```
+
+Cargamos tambien el conjunto de prueba o test:
+
+```{r}
+#Cargamos ctest
+ctest <- read.csv("test_set_features.csv")
+respondent_id <- ctest[,1]
+ctest <- ctest[,-1]
+
+ctest$education[ctest$education == ""] <- NA
+ctest$income_poverty[ctest$income_poverty == ""] <- NA
+ctest$marital_status[ctest$marital_status == ""] <- NA
+ctest$rent_or_own[ctest$rent_or_own == ""] <- NA
+ctest$employment_status[ctest$employment_status == ""] <- NA
+ctest$employment_industry[ctest$employment_industry == ""] <- NA
+ctest$employment_occupation[ctest$employment_occupation == ""] <- NA
+
+glimpse(ctest)
+ctest <-lapply(ctest[,1:35],as.factor)
+ctest <- as.data.frame(ctest)
+```
+
+
+Indicamos que las comillas vacías de las variables tipo *char* son *missing values*:
+```{r}
+df$education[df$education == ""] <- NA
+df$income_poverty[df$income_poverty == ""] <- NA
+df$marital_status[df$marital_status == ""] <- NA
+df$rent_or_own[df$rent_or_own == ""] <- NA
+df$employment_status[df$employment_status == ""] <- NA
+df$employment_industry[df$employment_industry == ""] <- NA
+df$employment_occupation[df$employment_occupation == ""] <- NA
+
+map_dbl(df, .f = function(x){sum(is.na(x))})
+```
+
+
+```{r}
+# train + label
+joined_df = merge(df,label)
+# Eliminamos la variable respondent_id
+joined_df <- joined_df[,-1]
+```
+
+```{r}
+joined_df <-lapply(joined_df[,1:37],as.factor)
+joined_df <- as.data.frame(joined_df)
+```
+
+Como vamos a realizar la clasificación siguiendo el método *Binary Relevance* vamos a separar el conjunto de entrenamiento para cada una de las etiquetas:
+```{r}
+train_seasonal <- joined_df[,-36]
+train_h1n1 <- joined_df[,-37]
+```
+
+En el fichero *Preprocesamiento8.Rmd* ya habíamos estudiado cuál eran las características de mayor a menor impotancia para cada una de las etiquetas asi que no repetiremos esta parte:
+
+- Tratamos a continuación el conjunto entrenamiento para **h1n1_vaccine**:
+```{r}
+train_h1n1_ind <- train_h1n1[,c(10,17,16,15,34,1,2,18,12,6,23,5,13,26,30,27,22,4,24,3,36)]
+```
+
+```{r}
+GKmatrix1<- GKtauDataframe(train_h1n1_ind)
+plot(GKmatrix1, corrColors = "purple2")
+```
+Para evitar dependencia entre los atributos, vamos a quitar `behavioral_avoidance` y `child_under_6_months`.
+
+```{r}
+train_h1n1_ind <- train_h1n1[,c(10,17,16,15,34,1,2,18,12,6,23,5,26,30,27,22,24,3,36)]
+```
+
+Veamos cuantos $NA$ tenemos en nuestro conjunto:
+```{r}
+map_dbl(train_h1n1_ind, .f = function(x){sum(is.na(x))})
+```
+
+```{r}
+delete.na <- function(DF, n=0) {
+  DF[rowSums(is.na(DF)) <= n,]
+}
+
+h1n1 <- delete.na(train_h1n1_ind,2)
+
+glimpse(h1n1)
+map_dbl(h1n1, .f = function(x){sum(is.na(x))})
+table(h1n1$h1n1_vaccine)
+``` 
+Clases desbalancedas. Aplicamos la técnica *upsampling*
+```{r}
+train_h1n1_balanced <- upSample(h1n1,h1n1$h1n1_vaccine)
+dim(train_h1n1_balanced)
+train_h1n1_balanced <- train_h1n1_balanced[,-20]
+```
+
+También aplicamos la técnica *downsampling*
+```{r}
+train_h1n1_balanced2 <- downSample(h1n1,h1n1$h1n1_vaccine)
+dim(train_h1n1_balanced2)
+train_h1n1_balanced2 <- train_h1n1_balanced2[,-20]
+```
+
+
+- Tratamos a continuación el conjunto entrenamiento para **seasonal_vaccine**:
+
+Seleccionamos las características más importantes para dicha vacuna (en el fichero *Preprocesamiento8.Rmd* se hizo el estudio de esa parte)
+```{r}
+train_seasonal_ind <- train_seasonal[,c(19,20,11,22,34,12,15,1,33,2,9,28,24,21,32,23,25,26,7,27,36)]
+GKmatrix2<- GKtauDataframe(train_seasonal_ind)
+plot(GKmatrix2, corrColors = "purple2")
+```
+
+Los atributos `marital_status`, `income_poverty` y `education` se quedan fuera por presentar una asociación notable con otras variables (segun la *tau* del test de Goodman).
+
+```{r}
+train_seasonal_ind <- train_seasonal[,c(19,20,11,22,34,12,15,1,33,2,9,28,24,21,32,25,7,36)]
+```
+
+```{r}
+map_dbl(train_seasonal_ind, .f = function(x){sum(is.na(x))})
+```
+
+```{r}
+seasonal <- delete.na(train_seasonal_ind,2)
+
+glimpse(seasonal)
+map_dbl(seasonal, .f = function(x){sum(is.na(x))})
+table(seasonal$seasonal_vaccine)
+```
+No aplicaremos ninguna técnica de balanceo pues tenemos alrededor del $50$% de las instancias en cada clase de la etiqueta `seasonal_vaccine`
+
+## Clasificación: 
+
+Paralelizamos el trabajo de entrenamiento y predicción
+```{r}
+library(doParallel)
+mc <- makeCluster(detectCores())
+registerDoParallel(mc)
+```
+
+Procedemos a la clasificación con el uso del ensemble. Decidimos seleccionar en cada iteración $10$ atributos y entrenaremos un total de 100 modelos con el algoritmo de Naive-Bayes:
+
+```{r}
+test_seas <-ctest[,c(19,20,11,22,34,12,15,1,33,2,9,28,24,21,32,25,7)]
+mat_val_seasonal= c()
+for(i in 1:100){
+    val_ale = sample(17,10,replace=FALSE)
+    model_seasonal <- train(seasonal[,c(val_ale)],seasonal[,18],'nb',trControl=trainControl(method='cv',number=10),tuneLength = 10)
+    seasonal_predict = model_seasonal %>% predict(test_seas)
+    mat_val_seasonal = cbind(mat_val_seasonal,as.numeric(as.character(seasonal_predict)))
+}
+```
+
+
+
+```{r}
+test_h1 <- ctest[,c(10,17,16,15,34,1,2,18,12,6,23,5,26,30,27,22,24,3)]
+mat_val_h1n1 = c()
+for(i in 1:100){
+    val_ale = sample(18,10,replace=FALSE)
+    model_h1n1 <- train(train_h1n1_balanced[,c(val_ale)], train_h1n1_balanced[,19],'nb',
+                        trControl = trainControl("cv", number = 10),tuneLength = 10)
+    h1n1_predict = model_h1n1 %>% predict(test_h1)
+    mat_val_h1n1 = cbind(mat_val_h1n1,as.numeric(as.character(h1n1_predict)))
+}
+```
+
+
+
+```{r}
+seasonal_vacc <- apply(mat_val_seasonal,1,mean)
+h1n1_vacc <- apply(mat_val_h1n1,1,mean)
+submission26 <- data.frame(respondent_id, h1n1_vacc,seasonal_vacc)
+colnames(submission26) <-c('respondent_id', 'h1n1_vaccine', 'seasonal_vaccine')
+write.csv(submission26,"C:/Users/iemat/Desktop/Preprocesamiento/Preprocesamiento/submission26.csv", row.names = FALSE)
+```
+
+```{r}
+stopCluster(mc)
+```
+
+
+A continuación, otra opción para entrenar el modelo para la vacuna h1n1 es usar los datos balanceados con técnica de **downsampling**:
+
+```{r}
+test_h1 <- ctest[,c(10,17,16,15,34,1,2,18,12,6,23,5,26,30,27,22,24,3)]
+mat_val_h1n1 = c()
+for(i in 1:100){
+    val_ale = sample(18,10,replace=FALSE)
+    model_h1n1 <- train(train_h1n1_balanced2[,c(val_ale)], train_h1n1_balanced2[,19],'nb',
+                        trControl = trainControl("cv", number = 10),tuneLength = 10)
+    h1n1_predict = model_h1n1 %>% predict(test_h1)
+    mat_val_h1n1 = cbind(mat_val_h1n1,as.numeric(as.character(h1n1_predict)))
+}
+```
+
+
+```{r}
+h1n1_vacc <- apply(mat_val_h1n1,1,mean)
+submission27 <- data.frame(respondent_id, h1n1_vacc,seasonal_vacc)
+colnames(submission27) <-c('respondent_id', 'h1n1_vaccine', 'seasonal_vaccine')
+write.csv(submission27,"C:/Users/iemat/Desktop/Preprocesamiento/Preprocesamiento/submission27.csv", row.names = FALSE)
+```
+
+Hemos obtenido un score igual a $0.8138$
+
+A continuación, con el objetivo de mejorar dicha predicción, decidimos seleccionar (aleatoriamente) en cada iteración $6$ características en lugar de $10$:
+
+```{r}
+test_seas <-ctest[,c(19,20,11,22,34,12,15,1,33,2,9,28,24,21,32,25,7)]
+mat_val_seasonal= c()
+for(i in 1:100){
+    val_ale = sample(17,6,replace=FALSE)
+    model_seasonal <- train(seasonal[,c(val_ale)],seasonal[,18],'nb',trControl=trainControl(method='cv',number=10),tuneLength = 10)
+    seasonal_predict = model_seasonal %>% predict(test_seas)
+    mat_val_seasonal = cbind(mat_val_seasonal,as.numeric(as.character(seasonal_predict)))
+}
+```
+
+
+```{r}
+test_h1 <- ctest[,c(10,17,16,15,34,1,2,18,12,6,23,5,26,30,27,22,24,3)]
+mat_val_h1n1 = c()
+for(i in 1:100){
+    val_ale = sample(18,6,replace=FALSE)
+    model_h1n1 <- train(train_h1n1_balanced2[,c(val_ale)], train_h1n1_balanced2[,19],'nb',
+                        trControl = trainControl("cv", number = 10),tuneLength = 10)
+    h1n1_predict = model_h1n1 %>% predict(test_h1)
+    mat_val_h1n1 = cbind(mat_val_h1n1,as.numeric(as.character(h1n1_predict)))
+}
+```
+
+
+```{r}
+seasonal_vacc <- apply(mat_val_seasonal,1,mean)
+h1n1_vacc <- apply(mat_val_h1n1,1,mean)
+submission35 <- data.frame(respondent_id, h1n1_vacc,seasonal_vacc)
+colnames(submission35) <-c('respondent_id', 'h1n1_vaccine', 'seasonal_vaccine')
+write.csv(submission35,"C:/Users/iemat/Desktop/Preprocesamiento/Preprocesamiento/submission35.csv", row.names = FALSE)
+```
+
+Se obtiene un $0.81$ de tasa de acierto para el conjunto de test. Con el objetivo de observar mejoría en el uso de emsembles, consideramos el suavizado de laplace para cada una de las etiquetas:
+
+
+```{r}
+test_h1 <- ctest[,c(10,17,16,15,34,1,2,18,12,6,23,5,26,30,27,22,24,3)]
+mat_val_h1n1 = c()
+for(i in 1:100){
+    val_ale = sample(18,6,replace=FALSE)
+    model_h1n1 <- naiveBayes(train_h1n1_balanced2[,c(val_ale,19)], train_h1n1_balanced2[,19],laplace = 1)
+    h1n1_predict = model_h1n1 %>% predict(test_h1)
+    mat_val_h1n1 = cbind(mat_val_h1n1,as.numeric(as.character(h1n1_predict)))
+}
+```
+
+
+```{r}
+h1n1_vacc <- apply(mat_val_h1n1,1,mean)
+submission36 <- data.frame(respondent_id, h1n1_vacc,seasonal_vacc)
+colnames(submission36) <-c('respondent_id', 'h1n1_vaccine', 'seasonal_vaccine')
+write.csv(submission36,"C:/Users/iemat/Desktop/Preprocesamiento/Preprocesamiento/submission36.csv", row.names = FALSE)
+```
+
+
+
+```{r}
+test_seas <-ctest[,c(19,20,11,22,34,12,15,1,33,2,9,28,24,21,32,25,7)]
+mat_val_seasonal= c()
+for(i in 1:100){
+    val_ale = sample(17,6,replace=FALSE)
+    model_seasonal <- naiveBayes(seasonal[,c(val_ale,18)],seasonal[,18],laplace = 1)
+    seasonal_predict = model_seasonal %>% predict(test_seas)
+    mat_val_seasonal = cbind(mat_val_seasonal,as.numeric(as.character(seasonal_predict)))
+}
+```
+
+
+```{r}
+seasonal_vacc <- apply(mat_val_seasonal,1,mean)
+submission37 <- data.frame(respondent_id, h1n1_vacc,seasonal_vacc)
+colnames(submission37) <-c('respondent_id', 'h1n1_vaccine', 'seasonal_vaccine')
+write.csv(submission37,"C:/Users/iemat/Desktop/Preprocesamiento/Preprocesamiento/submission37.csv", row.names = FALSE)
+```
+
+En ambos casos, hemos obtenido un score de $0.814$ aproximadamente. Por tanto, concluimos que hacer uso de multi-clasificación con ensembles (en nuestro caso con $100$ iteraciones y seleccionando $10$ y $6$ columnas aleatorias respectivamente) nos aporta una buena puntuación en base a la medida *AUC* pero no supera en ningún caso el umbral $0.81$. Sin embargo, hemos conseguido alcanzar el umbral $0.82$ usando el clasificador débil, Naive-Bayes únicamente con una selección de $7$ características, un balanceo para las clases de la vacuna *h1n1_vaccine* y un suavizado de laplace igual a $1$.
+
+
+
+Por último, probamos si con $500$ iteraciones mejoramos la tasa de acierto
+```{r}
+test_h1 <- ctest[,c(10,17,16,15,34,1,2,18,12,6,23,5,26,30,27,22,24,3)]
+mat_val_h1n1 = c()
+for(i in 1:500){
+    val_ale = sample(18,6,replace=FALSE)
+    model_h1n1 <- naiveBayes(train_h1n1_ind[,c(val_ale,19)], train_h1n1_ind[,19],laplace = 1)
+    h1n1_predict = model_h1n1 %>% predict(test_h1)
+    mat_val_h1n1 = cbind(mat_val_h1n1,as.numeric(as.character(h1n1_predict)))
+}
+
+
+test_seas <-ctest[,c(19,20,11,22,34,12,15,1,33,2,9,28,24,21,32,25,7)]
+mat_val_seasonal= c()
+for(i in 1:500){
+    val_ale = sample(17,6,replace=FALSE)
+    model_seasonal <- naiveBayes(train_seasonal_ind[,c(val_ale,18)],train_seasonal_ind[,18],laplace = 1)
+    seasonal_predict = model_seasonal %>% predict(test_seas)
+    mat_val_seasonal = cbind(mat_val_seasonal,as.numeric(as.character(seasonal_predict)))
+}
+
+h1n1_vacc <- apply(mat_val_h1n1,1,mean)
+seasonal_vacc <- apply(mat_val_seasonal,1,mean)
+submission37 <- data.frame(respondent_id, h1n1_vacc,seasonal_vacc)
+colnames(submission37) <-c('respondent_id', 'h1n1_vaccine', 'seasonal_vaccine')
+write.csv(submission37,"C:/Users/iemat/Desktop/Preprocesamiento/Preprocesamiento/ensemble500.csv", row.names = FALSE)
+```
+Obtenemos un $0.809$ de acierto así que concluimos que el método ensemble no mejora el rendimiento de Naive-Bayes.

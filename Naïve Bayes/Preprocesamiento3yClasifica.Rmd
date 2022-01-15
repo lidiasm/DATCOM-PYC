@@ -1,0 +1,319 @@
+---
+title: "Preprocesamiento3"
+author: "Laura Antequera Pérez"
+date: "2/1/2022"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Preprocesamiento
+
+```{r message=FALSE, warning=FALSE, include=FALSE}
+library(dplyr)
+library(mice)
+library(caret)
+library(purrr)
+library(mice)
+library(ROSE)
+library(caret)
+library(naivebayes)
+library(GoodmanKruskal)
+library(e1071)
+```
+
+En primer lugar cargaremos los datos disponibles para entrenamiento:
+```{r}
+df <- read.csv("training_set_features.csv")
+
+glimpse(df)
+```
+
+
+Analizamos cuántos *missing values* tenemos por cada variable de nuestro conjunto de datos. Y le prestaremos especial atención a las variables de tipo `char` con comillas vacias.
+```{r}
+#hay filas con NA:
+any(!complete.cases(df))
+
+#En total:
+sum(!complete.cases(df))
+
+map_dbl(df, .f = function(x){sum(is.na(x))})
+
+map_lgl(df, .f = function(x){any(!is.na(x) & x == "")})
+
+```
+
+Indicamos que las comillas vacías son *missing values*:
+```{r}
+df$education[df$education == ""] <- NA
+df$income_poverty[df$income_poverty == ""] <- NA
+df$marital_status[df$marital_status == ""] <- NA
+df$rent_or_own[df$rent_or_own == ""] <- NA
+df$employment_status[df$employment_status == ""] <- NA
+df$employment_industry[df$employment_industry == ""] <- NA
+df$employment_occupation[df$employment_occupation == ""] <- NA
+
+map_dbl(df, .f = function(x){sum(is.na(x))})
+```
+
+Como todas nuestras variables predictivas son categóricas convertimos cada una de ellas a `factor`.
+```{r}
+# Eliminamos la variable respondent_id
+df <- df[,-1]
+df <-lapply(df[,1:35],as.factor)
+glimpse(df)
+df <- as.data.frame(df)
+```
+
+
+Para la imputación de *NA* usaremos un método de *random forest* del paquete `missForest` (es distinto al del guión anterior).
+```{r}
+#Imputamos NA en train
+library(missForest)
+data_impu <- missForest(df)
+train_clean <- data_impu$ximp
+
+map_dbl(train_clean, .f = function(x){sum(is.na(x))})
+```
+
+
+Cargamos también el dataset de las etiquetas del conjunto de entrenamiento
+```{r}
+#cargamos labels
+label <- read.csv("training_set_labels.csv")
+glimpse(label)
+```
+
+Unimos el conjunto de entrenamiento y el de las etiquetas. Posteriormente, eliminaremos las tres variables que hemos observado que tienen más del $40$% de *missing values* junto con la variable `respondent_id`.
+```{r}
+# tarda mucho, está guardada la tabla limpia
+#train_clean <- read.csv("train_MissForest.csv")
+joined_df = cbind(train_clean,label[,-1])
+glimpse(joined_df)
+```
+
+Usaremos el test *Kruskal Tau de Goodman* para estudiar la fuerza de la asociación de todas las variables categóricas dos a dos. 
+```{r}
+GKmatrix1<- GKtauDataframe(joined_df)
+#plot(GKmatrix1, corrColors = "purple2")
+```
+Observamos que entre las variables predictivas no hay ninguna que tenga un coeficiente *tau* elevado, es decir, una asociación fuerte. Por tanto, no tenemos ninguna variable predictiva que se pueda predecir a partir de otra. Por otro lado, podemos nombrar las variables que presentan una asociación muy débil con las variables respuesta:
+
++ `behavioral_antiviral_meds` (columna 3)
+
++ `behavioral_avoidance` (columna 4)
+
++ `behavioral_face_mask` (columna 5)
+
++ `behavioral_large_gatherings`(columna 6)
+
++ `behavioral_outside_home` (columna 7)
+
++ `child_under_6_months` (columna 13)
+
++ `education` (columna 23)
+
++ `sex` (columna 25)
+
++ `income_poverty` (columna 26)
+
++ `marital_status` (columna 27)
+
++ `hhs_geo_region` (columna 30)
+
++ `census_msa` (columna 31)
+
++ `household_adults` (columna 32)
+
+Estás podrán ser candidatas a eliminarse de nuestro conjunto de datos para ejecutar el algoritmo de clasificación seleccionado. 
+
+```{r}
+#Cargamos test
+test <- read.csv("test_set_features.csv")
+respondent_id <- test[,1]
+test <- test[,-1]
+
+test$education[test$education == ""] <- NA
+test$income_poverty[test$income_poverty == ""] <- NA
+test$marital_status[test$marital_status == ""] <- NA
+test$rent_or_own[test$rent_or_own == ""] <- NA
+test$employment_status[test$employment_status == ""] <- NA
+test$employment_industry[test$employment_industry == ""] <- NA
+test$employment_occupation[test$employment_occupation == ""] <- NA
+
+glimpse(test)
+test <-lapply(test[,1:35],as.factor)
+test <- as.data.frame(test)
+
+```
+
+```{r}
+#Imputamos NA en test
+data_impu <- missForest(test, maxiter = 5)
+test_clean <- data_impu$ximp
+
+#Recuperamos el fichero guardado de test_clean
+#test_clean <- read.csv("test_MissForest.csv")
+test_clean <-lapply(test_clean[,1:35],as.factor)
+glimpse(test_clean)
+test_clean <- as.data.frame(test_clean)
+```
+
+
+Balanceamiento **DownSampling**:
+```{r}
+joined_df$h1n1_vaccine <- factor(joined_df$h1n1_vaccine)
+joined_df$seasonal_vaccine <- factor(joined_df$seasonal_vaccine)
+
+data_balanc2 <-downSample(joined_df,joined_df$h1n1_vaccine)
+data_balanc2 %>%group_by(h1n1_vaccine) %>% summarise(total=n())
+data_balanc2 %>%group_by(seasonal_vaccine) %>% summarise(total=n())
+
+data_balanc2 <- data_balanc2[,-38]
+data_balanc2 <-lapply(data_balanc2[,1:37],as.factor)
+glimpse(data_balanc2)
+data_balanc2 <- as.data.frame(data_balanc2)
+```
+
+Balanceamiento **Smote: Synthetic Minority Oversampling Technique To Handle Class Imbalancy In Binary Classification**
+
+```{r}
+#prop.table(table(joined_df$h1n1_vaccine))
+#table(joined_df$h1n1_vaccine)
+#prop.table(table(joined_df$seasonal_vaccine))
+#table(joined_df$seasonal_vaccine)
+```
+
+Vamos a considerar la variable que presenta el desbalanceamiento, `h1n1_vaccine`. Establecemos el parámetro `perc.over=100` para duplicar la cantidad de casos positivos y `perc.under=200` para mantener la mitad de lo que se creó como casos negativos.
+```{r}
+## Loading performanceEstimation to balance the unbalanced class
+#library(performanceEstimation)
+#set.seed(2022) # Para tener resultados reproducibles
+#data_balanc6 <- smote(factor(h1n1_vaccine) ~ ., data = joined_df)
+```
+
+
+## Clasificación 
+
+En este guión, usaremos una de las técnicas más simple para un conjunto multietiqueta, denominada **Binary Relevance**, que básicamente trata cada etiqueta como un problema de clasificación de una sola clase por separado.
+
+```{r}
+# Naive-Bayes:
+#Reducimos el conjunto eliminando las variables que presentan una asoc. muy débil con las variables respuesta/etiqueta 
+sms_classifier14 <- naiveBayes(joined_df[,-c(3,4,5,6,7,13,23,25,26,27,30,31,32,36,37)], factor(joined_df[,37]))
+seasonal_vacc <- predict(sms_classifier14, test_clean[,-c(3,4,5,6,7,13,23,25,26,27,30,31,32)], type = 'raw')
+
+sms_classifier15 <- naiveBayes(joined_df[,-c(3,4,5,6,7,13,23,25,26,27,30,31,32,36,37)], factor(joined_df[,36]))
+h1n1_vacc <- predict(sms_classifier15, test_clean[,-c(3,4,5,6,7,13,23,25,26,27,30,31,32)], type = 'raw')
+
+submission9 <- data.frame(respondent_id, h1n1_vacc[,2],seasonal_vacc[,2])
+colnames(submission9) <-c('respondent_id', 'h1n1_vaccine', 'seasonal_vaccine')
+
+write.csv(submission9,"C:/Users/iemat/Desktop/Preprocesamiento/submission9.csv", row.names = FALSE)
+```
+
+Usaremos la siguiente rejilla para entrenar Naive-Bayes con el paquete `caret`:
+
++ `usekernel`: TRUE para emplear un kernel que estime la densidad o FALSE para asumir una distribución de densidad gaussiana (en nuestros datos se espera que no se asuma una distribución gaussiana).
+
++ `fL`: factor de corrección o suavizado de Laplace, 0 para no aplicar ninguna corrección.
+
++ `adjust`: parámetro pasado a la función density si usekernel = TRUE.
+```{r}
+train_control <- trainControl(
+  method = "cv", 
+  number = 10
+  )
+nb_grid <-   expand.grid(usekernel = c(TRUE, FALSE),
+                         laplace = c(0, 1, 2, 3, 4), 
+                         adjust = c(0.75, 1, 1.25, 1.5))
+
+naive_bayes_via_caret6 <- train(h1n1_vaccine ~ ., 
+                               data = data_balanc2[,-c(3,4,5,6,7,13,23,25,26,27,30,31,32,35,37)], 
+                               method = "naive_bayes", 
+                               tuneGrid = nb_grid,
+                               trControl = train_control)
+
+h1n1_vacc <- predict(naive_bayes_via_caret6, newdata = test_clean, type = "prob")
+
+naive_bayes_via_caret7 <- train(seasonal_vaccine ~ ., 
+                               data = data_balanc2[,-c(3,4,5,6,7,13,23,25,26,27,30,31,32,35,36)], 
+                               method = "naive_bayes", 
+                               tuneGrid = nb_grid,
+                               trControl = train_control)
+
+seasonal_vacc <- predict(naive_bayes_via_caret7, newdata = test_clean, type = "prob")
+
+submission16 <- data.frame(respondent_id, h1n1_vacc[,2],seasonal_vacc[,2])
+colnames(submission16) <-c('respondent_id', 'h1n1_vaccine', 'seasonal_vaccine')
+
+write.csv(submission16,"C:/Users/Lenovo/OneDrive/Escritorio/Preprocesamiento/Preprocesamiento/submission16.csv", row.names = FALSE)
+```
+
+
+
+A continuación, ejecutaremos un ensemble. En cada iteración o en cada modelo se producirá una predicción diferente dando lugar a una única:
+```{r}
+mat_seasonal <- c()
+for(i in 1:50){
+  var_random <- sample(35,6,replace = FALSE)
+  seasonal_naive <-train(seasonal_vaccine~., data = joined_df[,c(var_random,37)], method = "naive_bayes", 
+                         trControl = trainControl("cv", number = 10), tuneLength = 10)
+  predicciones <- seasonal_naive %>% predict(test_clean)
+  mat_seasonal <- cbind(mat_seasonal, as.numeric(as.character(predicciones)))
+}
+
+mat_h1n1 <- c()
+for(i in 1:50){
+  var_random <- sample(35,6,replace = FALSE)
+  h1n1_naive <-train(h1n1_vaccine~., data = joined_df[,c(var_random,36)], method = "naive_bayes", 
+                         trControl = trainControl("cv", number = 10), tuneLength = 10)
+  predicciones <- h1n1_naive %>% predict(test_clean)
+  mat_h1n1 <- cbind(mat_h1n1, as.numeric(as.character(predicciones)))
+}
+
+seasonal_vacc <- apply(mat_seasonal,1, mean)
+
+h1n1_vacc <- apply(mat_h1n1, 1, mean)
+
+submission17 <- data.frame(respondent_id, h1n1_vacc,seasonal_vacc)
+colnames(submission17) <-c('respondent_id', 'h1n1_vaccine', 'seasonal_vaccine')
+
+write.csv(submission17,"C:/Users/Lenovo/OneDrive/Escritorio/Preprocesamiento/Preprocesamiento/submission17.csv", row.names = FALSE)
+```
+
+Observamos que como la clase de `h1n1_vacc` estaba desbalanceada hemos obtenido una probabilidad de $0$ para la clase $1$ en casi todas las observaciones. Vamos a usar los datos balanceados:
+
+```{r}
+mat_seasonal <- c()
+for(i in 1:50){
+  var_random <- sample(35,10,replace = FALSE)
+  seasonal_naive <-train(seasonal_vaccine~., data = data_balanc2[,c(var_random,37)], method = "naive_bayes", 
+                         trControl = trainControl("cv", number = 10), tuneLength = 10)
+  predicciones <- seasonal_naive %>% predict(test_clean[,var_random])
+  mat_seasonal <- cbind(mat_seasonal, as.numeric(as.character(predicciones)))
+}
+
+mat_h1n1 <- c()
+for(i in 1:50){
+  var_random <- sample(35,10,replace = FALSE)
+  h1n1_naive <-train(h1n1_vaccine~., data = data_balanc2[,c(var_random,36)], method = "naive_bayes", 
+                         trControl = trainControl("cv", number = 10), tuneLength = 10)
+  predicciones <- h1n1_naive %>% predict(test_clean[,c(var_random)])
+  mat_h1n1 <- cbind(mat_h1n1, as.numeric(as.character(predicciones)))
+}
+
+seasonal_vacc <- apply(mat_seasonal,1, mean)
+
+h1n1_vacc <- apply(mat_h1n1, 1, mean)
+
+submission17 <- data.frame(respondent_id, h1n1_vacc,seasonal_vacc)
+colnames(submission17) <-c('respondent_id', 'h1n1_vaccine', 'seasonal_vaccine')
+
+write.csv(submission17,"C:/Users/Lenovo/OneDrive/Escritorio/Preprocesamiento/Preprocesamiento/submission17.csv", row.names = FALSE)
+```
+
+El score consesguido en test ha sido de $0.776$.
